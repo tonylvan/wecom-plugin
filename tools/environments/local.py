@@ -155,7 +155,13 @@ def _find_bash() -> str:
 
     found = shutil.which("bash")
     if found:
-        return found
+        # On Windows, shutil.which("bash") often finds the WSL shim at
+        # C:\Windows\System32\bash.exe, which just launches WSL instead of
+        # running a real bash subprocess. Skip it and look for Git Bash.
+        if _IS_WINDOWS and "System32" in found:
+            pass
+        else:
+            return found
 
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),

@@ -248,7 +248,7 @@ def run_doctor(args):
         check_ok(f"{_DHH}/.env file exists")
         
         # Check for common issues
-        content = env_path.read_text()
+        content = env_path.read_text(encoding='utf-8')
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
         else:
@@ -845,7 +845,7 @@ def run_doctor(args):
         if lock_file.exists():
             try:
                 import json
-                lock_data = json.loads(lock_file.read_text())
+                lock_data = json.loads(lock_file.read_text(encoding='utf-8'))
                 count = len(lock_data.get("installed", {}))
                 check_ok(f"Lock file OK ({count} hub-installed skill(s))")
             except Exception:
@@ -978,7 +978,7 @@ def run_doctor(args):
                     if not wrapper.is_file():
                         continue
                     try:
-                        content = wrapper.read_text()
+                        content = wrapper.read_text(encoding='utf-8')
                         if "hermes -p" in content:
                             _m = _re.search(r"hermes -p (\S+)", content)
                             if _m and not profile_exists(_m.group(1)):

@@ -533,7 +533,7 @@ def _reap_orphaned_browser_sessions():
         # Check if the daemon is still alive
         try:
             os.kill(daemon_pid, 0)  # signal 0 = existence check
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             # Already dead, just clean up the dir
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
@@ -2179,7 +2179,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                 pid_file = os.path.join(socket_dir, f"{session_name}.pid")
                 if os.path.isfile(pid_file):
                     try:
-                        daemon_pid = int(Path(pid_file).read_text().strip())
+                        daemon_pid = int(Path(pid_file).read_text(encoding='utf-8').strip())
                         os.kill(daemon_pid, signal.SIGTERM)
                         logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
                     except (ProcessLookupError, ValueError, PermissionError, OSError):

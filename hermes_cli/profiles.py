@@ -304,7 +304,7 @@ def _check_gateway_running(profile_dir: Path) -> bool:
     if not pid_file.exists():
         return False
     try:
-        raw = pid_file.read_text().strip()
+        raw = pid_file.read_text(encoding='utf-8').strip()
         if not raw:
             return False
         data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
@@ -655,7 +655,7 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         return
 
     try:
-        raw = pid_file.read_text().strip()
+        raw = pid_file.read_text(encoding='utf-8').strip()
         data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
         pid = int(data["pid"])
         os.kill(pid, _signal.SIGTERM)
