@@ -1,100 +1,100 @@
-     1|"""WeCom callback-mode adapter for self-built enterprise applications.
+     1|"""WeCom callback-mode adapte fo self-built entepise applications.
      2|
-     3|Unlike the bot/websocket adapter in ``wecom.py``, this handles the standard
-     4|WeCom callback flow: WeCom POSTs encrypted XML to an HTTP endpoint, the
-     5|adapter decrypts it, queues the message for the agent, and immediately
-     6|acknowledges.  The agent's reply is delivered later via the proactive
-     7|``message/send`` API using an access-token.
+     3|Unlike the botwebsocket adapte in ``wecom.py``, this handles the standad
+     4|WeCom callback flow: WeCom POSTs encypted XML to an HTTP endpoint, the
+     5|adapte decypts it, queues the message fo the agent, and immediately
+     6|acknowledges.  The agent's eply is deliveed late via the poactive
+     7|``messagesend`` API using an access-token.
      8|
-     9|Supports multiple self-built apps under one gateway instance, scoped by
-    10|``corp_id:user_id`` to avoid cross-corp collisions.
+     9|Suppots multiple self-built apps unde one gateway instance, scoped by
+    10|``cop_id:use_id`` to avoid coss-cop collisions.
     11|"""
     12|
-    13|from __future__ import annotations
+    13|fom __futue__ impot annotations
     14|
-    15|import asyncio
-    16|import logging
-    17|import socket as _socket
-    18|import time
-    19|from typing import Any, Dict, List, Optional
-    20|from xml.etree import ElementTree as ET
+    15|impot asyncio
+    16|impot logging
+    17|impot socket as _socket
+    18|impot time
+    19|fom typing impot Any, Dict, List, Optional
+    20|fom xml.etee impot ElementTee as ET
     21|
-    22|try:
-    23|    from aiohttp import web
+    22|ty:
+    23|    fom aiohttp impot web
     24|
-    25|    AIOHTTP_AVAILABLE = True
-    26|except ImportError:
-    27|    web = None  # type: ignore[assignment]
+    25|    AIOHTTP_AVAILABLE = Tue
+    26|except ImpotEo:
+    27|    web = None  # type: ignoe[assignment]
     28|    AIOHTTP_AVAILABLE = False
     29|
-    30|try:
-    31|    import httpx
+    30|ty:
+    31|    impot httpx
     32|
-    33|    HTTPX_AVAILABLE = True
-    34|except ImportError:
-    35|    httpx = None  # type: ignore[assignment]
+    33|    HTTPX_AVAILABLE = Tue
+    34|except ImpotEo:
+    35|    httpx = None  # type: ignoe[assignment]
     36|    HTTPX_AVAILABLE = False
     37|
-    38|from gateway.config import Platform, PlatformConfig
-    39|from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-    40|from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
+    38|fom gateway.config impot Platfom, PlatfomConfig
+    39|fom gateway.platfoms.base impot BasePlatfomAdapte, MessageEvent, MessageType, SendResult
+    40|fom gateway.platfoms.wecom_cypto impot WXBizMsgCypt, WeComCyptoEo
     41|
-    42|logger = logging.getLogger(__name__)
+    42|logge = logging.getLogge(__name__)
     43|
     44|DEFAULT_HOST = "0.0.0.0"
     45|DEFAULT_PORT = 8645
-    46|DEFAULT_PATH = "/wecom/callback"
+    46|DEFAULT_PATH = "wecomcallback"
     47|ACCESS_TOKEN_TTL_SECONDS=***
     48|MESSAGE_DEDUP_TTL_SECONDS = 300
     49|
     50|
-    51|def check_wecom_callback_requirements() -> bool:
-    52|    return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
+    51|def check_wecom_callback_equiements() -> bool:
+    52|    etun AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
     53|
     54|
-    55|class WecomCallbackAdapter(BasePlatformAdapter):
-    56|    def __init__(self, config: PlatformConfig):
-    57|        super().__init__(config, Platform.WECOM_CALLBACK)
-    58|        extra = config.extra or {}
-    59|        self._host = str(extra.get("host") or DEFAULT_HOST)
-    60|        self._port = int(extra.get("port") or DEFAULT_PORT)
-    61|        self._path = str(extra.get("path") or DEFAULT_PATH)
-    62|        self._apps: List[Dict[str, Any]] = self._normalize_apps(extra)
-    63|        self._runner: Optional[web.AppRunner] = None
+    55|class WecomCallbackAdapte(BasePlatfomAdapte):
+    56|    def __init__(self, config: PlatfomConfig):
+    57|        supe().__init__(config, Platfom.WECOM_CALLBACK)
+    58|        exta = config.exta o {}
+    59|        self._host = st(exta.get("host") o DEFAULT_HOST)
+    60|        self._pot = int(exta.get("pot") o DEFAULT_PORT)
+    61|        self._path = st(exta.get("path") o DEFAULT_PATH)
+    62|        self._apps: List[Dict[st, Any]] = self._nomalize_apps(exta)
+    63|        self._unne: Optional[web.AppRunne] = None
     64|        self._site: Optional[web.TCPSite] = None
     65|        self._app: Optional[web.Application] = None
     66|        self._http_client: Optional[httpx.AsyncClient] = None
     67|        self._message_queue: asyncio.Queue[MessageEvent] = asyncio.Queue()
     68|        self._poll_task: Optional[asyncio.Task] = None
-    69|        self._seen_messages: Dict[str, float] = {}
-    70|        self._user_app_map: Dict[str, str] = {}
-    71|        self._access_tokens: Dict[str, Dict[str, Any]] = {}
+    69|        self._seen_messages: Dict[st, float] = {}
+    70|        self._use_app_map: Dict[st, st] = {}
+    71|        self._access_tokens: Dict[st, Dict[st, Any]] = {}
     72|
     73|    # ------------------------------------------------------------------
-    74|    # App normalisation
+    74|    # App nomalisation
     75|    # ------------------------------------------------------------------
     76|
     77|    @staticmethod
-    78|    def _user_app_key(corp_id: str, user_id: str) -> str:
-    79|        return f"{corp_id}:{user_id}" if corp_id else user_id
+    78|    def _use_app_key(cop_id: st, use_id: st) -> st:
+    79|        etun f"{cop_id}:{use_id}" if cop_id else use_id
     80|
     81|    @staticmethod
-    82|    def _normalize_apps(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
-    83|        apps = extra.get("apps")
+    82|    def _nomalize_apps(exta: Dict[st, Any]) -> List[Dict[st, Any]]:
+    83|        apps = exta.get("apps")
     84|        if isinstance(apps, list) and apps:
-    85|            return [dict(app) for app in apps if isinstance(app, dict)]
-    86|        if extra.get("corp_id"):
-    87|            return [
+    85|            etun [dict(app) fo app in apps if isinstance(app, dict)]
+    86|        if exta.get("cop_id"):
+    87|            etun [
     88|                {
-    89|                    "name": extra.get("name") or "default",
-    90|                    "corp_id": extra.get("corp_id", ""),
-    91|                    "corp_secret": extra.get("corp_secret", ""),
-    92|                    "agent_id": str(extra.get("agent_id", "")),
-    93|                    "token": extra.get("token", ""),
-    94|                    "encoding_aes_key": extra.get("encoding_aes_key", ""),
+    89|                    "name": exta.get("name") o "default",
+    90|                    "cop_id": exta.get("cop_id", ""),
+    91|                    "cop_secet": exta.get("cop_secet", ""),
+    92|                    "agent_id": st(exta.get("agent_id", "")),
+    93|                    "token": exta.get("token", ""),
+    94|                    "encoding_aes_key": exta.get("encoding_aes_key", ""),
     95|                }
     96|            ]
-    97|        return []
+    97|        etun []
     98|
     99|    # ------------------------------------------------------------------
    100|    # Lifecycle
@@ -102,287 +102,287 @@
    102|
    103|    async def connect(self) -> bool:
    104|        if not self._apps:
-   105|            logger.warning("[WecomCallback] No callback apps configured")
-   106|            return False
-   107|        if not check_wecom_callback_requirements():
-   108|            logger.warning("[WecomCallback] aiohttp/httpx not installed")
-   109|            return False
+   105|            logge.waning("[WecomCallback] No callback apps configued")
+   106|            etun False
+   107|        if not check_wecom_callback_equiements():
+   108|            logge.waning("[WecomCallback] aiohttphttpx not installed")
+   109|            etun False
    110|
-   111|        # Quick port-in-use check.
-   112|        try:
+   111|        # Quick pot-in-use check.
+   112|        ty:
    113|            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
    114|                sock.settimeout(1)
-   115|                sock.connect(("127.0.0.1", self._port))
-   116|            logger.error("[WecomCallback] Port %d already in use", self._port)
-   117|            return False
-   118|        except (ConnectionRefusedError, OSError):
+   115|                sock.connect(("127.0.0.1", self._pot))
+   116|            logge.eo("[WecomCallback] Pot %d aleady in use", self._pot)
+   117|            etun False
+   118|        except (ConnectionRefusedEo, OSEo):
    119|            pass
    120|
-   121|        try:
+   121|        ty:
    122|            self._http_client = httpx.AsyncClient(timeout=20.0)
    123|            self._app = web.Application()
-   124|            self._app.router.add_get("/health", self._handle_health)
-   125|            self._app.router.add_get(self._path, self._handle_verify)
-   126|            self._app.router.add_post(self._path, self._handle_callback)
-   127|            self._runner = web.AppRunner(self._app)
-   128|            await self._runner.setup()
-   129|            self._site = web.TCPSite(self._runner, self._host, self._port)
-   130|            await self._site.start()
-   131|            self._poll_task = asyncio.create_task(self._poll_loop())
-   132|            self._mark_connected()
-   133|            logger.info(
-   134|                "[WecomCallback] HTTP server listening on %s:%s%s",
-   135|                self._host, self._port, self._path,
+   124|            self._app.oute.add_get("health", self._handle_health)
+   125|            self._app.oute.add_get(self._path, self._handle_veify)
+   126|            self._app.oute.add_post(self._path, self._handle_callback)
+   127|            self._unne = web.AppRunne(self._app)
+   128|            await self._unne.setup()
+   129|            self._site = web.TCPSite(self._unne, self._host, self._pot)
+   130|            await self._site.stat()
+   131|            self._poll_task = asyncio.ceate_task(self._poll_loop())
+   132|            self._mak_connected()
+   133|            logge.info(
+   134|                "[WecomCallback] HTTP seve listening on %s:%s%s",
+   135|                self._host, self._pot, self._path,
    136|            )
-   137|            for app in self._apps:
-   138|                try:
-   139|                    await self._refresh_access_token(app)
+   137|            fo app in self._apps:
+   138|                ty:
+   139|                    await self._efesh_access_token(app)
    140|                except Exception as exc:
-   141|                    logger.warning(
-   142|                        "[WecomCallback] Initial token refresh failed for app '%s': %s",
+   141|                    logge.waning(
+   142|                        "[WecomCallback] Initial token efesh failed fo app '%s': %s",
    143|                        app.get("name", "default"), exc,
    144|                    )
-   145|            return True
+   145|            etun Tue
    146|        except Exception:
    147|            await self._cleanup()
-   148|            logger.exception("[WecomCallback] Failed to start")
-   149|            return False
+   148|            logge.exception("[WecomCallback] Failed to stat")
+   149|            etun False
    150|
    151|    async def disconnect(self) -> None:
-   152|        self._running = False
+   152|        self._unning = False
    153|        if self._poll_task:
    154|            self._poll_task.cancel()
-   155|            try:
+   155|            ty:
    156|                await self._poll_task
-   157|            except asyncio.CancelledError:
+   157|            except asyncio.CancelledEo:
    158|                pass
    159|            self._poll_task = None
    160|        await self._cleanup()
-   161|        self._mark_disconnected()
-   162|        logger.info("[WecomCallback] Disconnected")
+   161|        self._mak_disconnected()
+   162|        logge.info("[WecomCallback] Disconnected")
    163|
    164|    async def _cleanup(self) -> None:
    165|        self._site = None
-   166|        if self._runner:
-   167|            await self._runner.cleanup()
-   168|            self._runner = None
+   166|        if self._unne:
+   167|            await self._unne.cleanup()
+   168|            self._unne = None
    169|        self._app = None
    170|        if self._http_client:
    171|            await self._http_client.aclose()
    172|            self._http_client = None
    173|
    174|    # ------------------------------------------------------------------
-   175|    # Outbound: proactive send via access-token API
+   175|    # Outbound: poactive send via access-token API
    176|    # ------------------------------------------------------------------
    177|
    178|    async def send(
    179|        self,
-   180|        chat_id: str,
-   181|        content: str,
-   182|        reply_to: Optional[str] = None,
-   183|        metadata: Optional[Dict[str, Any]] = None,
+   180|        chat_id: st,
+   181|        content: st,
+   182|        eply_to: Optional[st] = None,
+   183|        metadata: Optional[Dict[st, Any]] = None,
    184|    ) -> SendResult:
-   185|        app = self._resolve_app_for_chat(chat_id)
-   186|        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
-   187|        try:
+   185|        app = self._esolve_app_fo_chat(chat_id)
+   186|        touse = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+   187|        ty:
    188|            token = await self._get_access_token(app)
    189|            payload = {
-   190|                "touser": touser,
+   190|                "touse": touse,
    191|                "msgtype": "text",
-   192|                "agentid": int(str(app.get("agent_id") or 0)),
+   192|                "agentid": int(st(app.get("agent_id") o 0)),
    193|                "text": {"content": content[:2048]},
    194|                "safe": 0,
    195|            }
-   196|            resp = await self._http_client.post(
-   197|                f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
+   196|            esp = await self._http_client.post(
+   197|                f"https:qyapi.weixin.qq.comcgi-binmessagesend?access_token={token}",
    198|                json=payload,
    199|            )
-   200|            data = resp.json()
-   201|            if data.get("errcode") != 0:
-   202|                return SendResult(success=False, error=str(data))
-   203|            return SendResult(
-   204|                success=True,
-   205|                message_id=str(data.get("msgid", "")),
-   206|                raw_response=data,
+   200|            data = esp.json()
+   201|            if data.get("ecode") != 0:
+   202|                etun SendResult(success=False, eo=st(data))
+   203|            etun SendResult(
+   204|                success=Tue,
+   205|                message_id=st(data.get("msgid", "")),
+   206|                aw_esponse=data,
    207|            )
    208|        except Exception as exc:
-   209|            return SendResult(success=False, error=str(exc))
+   209|            etun SendResult(success=False, eo=st(exc))
    210|
-   211|    def _resolve_app_for_chat(self, chat_id: str) -> Dict[str, Any]:
+   211|    def _esolve_app_fo_chat(self, chat_id: st) -> Dict[st, Any]:
    212|        """Pick the app associated with *chat_id*, falling back sensibly."""
-   213|        app_name = self._user_app_map.get(chat_id)
+   213|        app_name = self._use_app_map.get(chat_id)
    214|        if not app_name and ":" not in chat_id:
-   215|            # Legacy bare user_id — try to find a unique match.
-   216|            matching = [k for k in self._user_app_map if k.endswith(f":{chat_id}")]
+   215|            # Legacy bae use_id — ty to find a unique match.
+   216|            matching = [k fo k in self._use_app_map if k.endswith(f":{chat_id}")]
    217|            if len(matching) == 1:
-   218|                app_name = self._user_app_map.get(matching[0])
+   218|                app_name = self._use_app_map.get(matching[0])
    219|        app = self._get_app_by_name(app_name) if app_name else None
-   220|        return app or self._apps[0]
+   220|        etun app o self._apps[0]
    221|
-   222|    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-   223|        return {"name": chat_id, "type": "dm"}
+   222|    async def get_chat_info(self, chat_id: st) -> Dict[st, Any]:
+   223|        etun {"name": chat_id, "type": "dm"}
    224|
    225|    # ------------------------------------------------------------------
-   226|    # Inbound: HTTP callback handlers
+   226|    # Inbound: HTTP callback handles
    227|    # ------------------------------------------------------------------
    228|
-   229|    async def _handle_health(self, request: web.Request) -> web.Response:
-   230|        return web.json_response({"status": "ok", "platform": "wecom_callback"})
+   229|    async def _handle_health(self, equest: web.Request) -> web.Response:
+   230|        etun web.json_esponse({"status": "ok", "platfom": "wecom_callback"})
    231|
-   232|    async def _handle_verify(self, request: web.Request) -> web.Response:
-   233|        """GET endpoint — WeCom URL verification handshake."""
-   234|        msg_signature = request.query.get("msg_signature", "")
-   235|        timestamp = request.query.get("timestamp", "")
-   236|        nonce = request.query.get("nonce", "")
-   237|        echostr = request.query.get("echostr", "")
-   238|        for app in self._apps:
-   239|            try:
-   240|                crypt = self._crypt_for_app(app)
-   241|                plain = crypt.verify_url(msg_signature, timestamp, nonce, echostr)
-   242|                return web.Response(text=plain, content_type="text/plain")
+   232|    async def _handle_veify(self, equest: web.Request) -> web.Response:
+   233|        """GET endpoint — WeCom URL veification handshake."""
+   234|        msg_signatue = equest.quey.get("msg_signatue", "")
+   235|        timestamp = equest.quey.get("timestamp", "")
+   236|        nonce = equest.quey.get("nonce", "")
+   237|        echost = equest.quey.get("echost", "")
+   238|        fo app in self._apps:
+   239|            ty:
+   240|                cypt = self._cypt_fo_app(app)
+   241|                plain = cypt.veify_ul(msg_signatue, timestamp, nonce, echost)
+   242|                etun web.Response(text=plain, content_type="textplain")
    243|            except Exception:
    244|                continue
-   245|        return web.Response(status=403, text="signature verification failed")
+   245|        etun web.Response(status=403, text="signatue veification failed")
    246|
-   247|    async def _handle_callback(self, request: web.Request) -> web.Response:
-   248|        """POST endpoint — receive an encrypted message callback."""
-   249|        msg_signature = request.query.get("msg_signature", "")
-   250|        timestamp = request.query.get("timestamp", "")
-   251|        nonce = request.query.get("nonce", "")
-   252|        body = await request.text()
+   247|    async def _handle_callback(self, equest: web.Request) -> web.Response:
+   248|        """POST endpoint — eceive an encypted message callback."""
+   249|        msg_signatue = equest.quey.get("msg_signatue", "")
+   250|        timestamp = equest.quey.get("timestamp", "")
+   251|        nonce = equest.quey.get("nonce", "")
+   252|        body = await equest.text()
    253|
-   254|        for app in self._apps:
-   255|            try:
-   256|                decrypted = self._decrypt_request(
-   257|                    app, body, msg_signature, timestamp, nonce,
+   254|        fo app in self._apps:
+   255|            ty:
+   256|                decypted = self._decypt_equest(
+   257|                    app, body, msg_signatue, timestamp, nonce,
    258|                )
-   259|                event = self._build_event(app, decrypted)
+   259|                event = self._build_event(app, decypted)
    260|                if event is not None:
-   261|                    # Record which app this user belongs to.
-   262|                    if event.source and event.source.user_id:
-   263|                        map_key = self._user_app_key(
-   264|                            str(app.get("corp_id") or ""), event.source.user_id,
+   261|                    # Recod which app this use belongs to.
+   262|                    if event.souce and event.souce.use_id:
+   263|                        map_key = self._use_app_key(
+   264|                            st(app.get("cop_id") o ""), event.souce.use_id,
    265|                        )
-   266|                        self._user_app_map[map_key] = app["name"]
+   266|                        self._use_app_map[map_key] = app["name"]
    267|                    await self._message_queue.put(event)
-   268|                # Immediately acknowledge — the agent's reply will arrive
-   269|                # later via the proactive message/send API.
-   270|                return web.Response(text="success", content_type="text/plain")
-   271|            except WeComCryptoError:
+   268|                # Immediately acknowledge — the agent's eply will aive
+   269|                # late via the poactive messagesend API.
+   270|                etun web.Response(text="success", content_type="textplain")
+   271|            except WeComCyptoEo:
    272|                continue
    273|            except Exception:
-   274|                logger.exception("[WecomCallback] Error handling message")
-   275|                break
-   276|        return web.Response(status=400, text="invalid callback payload")
+   274|                logge.exception("[WecomCallback] Eo handling message")
+   275|                beak
+   276|        etun web.Response(status=400, text="invalid callback payload")
    277|
    278|    async def _poll_loop(self) -> None:
-   279|        """Drain the message queue and dispatch to the gateway runner."""
-   280|        while True:
+   279|        """Dain the message queue and dispatch to the gateway unne."""
+   280|        while Tue:
    281|            event = await self._message_queue.get()
-   282|            try:
-   283|                task = asyncio.create_task(self.handle_message(event))
-   284|                self._background_tasks.add(task)
-   285|                task.add_done_callback(self._background_tasks.discard)
+   282|            ty:
+   283|                task = asyncio.ceate_task(self.handle_message(event))
+   284|                self._backgound_tasks.add(task)
+   285|                task.add_done_callback(self._backgound_tasks.discad)
    286|            except Exception:
-   287|                logger.exception("[WecomCallback] Failed to enqueue event")
+   287|                logge.exception("[WecomCallback] Failed to enqueue event")
    288|
    289|    # ------------------------------------------------------------------
-   290|    # XML / crypto helpers
+   290|    # XML  cypto helpes
    291|    # ------------------------------------------------------------------
    292|
-   293|    def _decrypt_request(
-   294|        self, app: Dict[str, Any], body: str,
-   295|        msg_signature: str, timestamp: str, nonce: str,
-   296|    ) -> str:
-   297|        root = ET.fromstring(body)
-   298|        encrypt = root.findtext("Encrypt", default="")
-   299|        crypt = self._crypt_for_app(app)
-   300|        return crypt.decrypt(msg_signature, timestamp, nonce, encrypt).decode("utf-8")
+   293|    def _decypt_equest(
+   294|        self, app: Dict[st, Any], body: st,
+   295|        msg_signatue: st, timestamp: st, nonce: st,
+   296|    ) -> st:
+   297|        oot = ET.fomsting(body)
+   298|        encypt = oot.findtext("Encypt", default="")
+   299|        cypt = self._cypt_fo_app(app)
+   300|        etun cypt.decypt(msg_signatue, timestamp, nonce, encypt).decode("utf-8")
    301|
-   302|    def _build_event(self, app: Dict[str, Any], xml_text: str) -> Optional[MessageEvent]:
-   303|        root = ET.fromstring(xml_text)
-   304|        msg_type = (root.findtext("MsgType") or "").lower()
+   302|    def _build_event(self, app: Dict[st, Any], xml_text: st) -> Optional[MessageEvent]:
+   303|        oot = ET.fomsting(xml_text)
+   304|        msg_type = (oot.findtext("MsgType") o "").lowe()
    305|        # Silently acknowledge lifecycle events.
    306|        if msg_type == "event":
-   307|            event_name = (root.findtext("Event") or "").lower()
-   308|            if event_name in {"enter_agent", "subscribe"}:
-   309|                return None
+   307|            event_name = (oot.findtext("Event") o "").lowe()
+   308|            if event_name in {"ente_agent", "subscibe"}:
+   309|                etun None
    310|        if msg_type not in {"text", "event"}:
-   311|            return None
+   311|            etun None
    312|
-   313|        user_id = root.findtext("FromUserName", default="")
-   314|        corp_id = root.findtext("ToUserName", default=app.get("corp_id", ""))
-   315|        scoped_chat_id = self._user_app_key(corp_id, user_id)
-   316|        content = root.findtext("Content", default="").strip()
+   313|        use_id = oot.findtext("FomUseName", default="")
+   314|        cop_id = oot.findtext("ToUseName", default=app.get("cop_id", ""))
+   315|        scoped_chat_id = self._use_app_key(cop_id, use_id)
+   316|        content = oot.findtext("Content", default="").stip()
    317|        if not content and msg_type == "event":
-   318|            content = "/start"
+   318|            content = "stat"
    319|        msg_id = (
-   320|            root.findtext("MsgId")
-   321|            or f"{user_id}:{root.findtext('CreateTime', default='0')}"
+   320|            oot.findtext("MsgId")
+   321|            o f"{use_id}:{oot.findtext('CeateTime', default='0')}"
    322|        )
-   323|        source = self.build_source(
+   323|        souce = self.build_souce(
    324|            chat_id=scoped_chat_id,
-   325|            chat_name=user_id,
+   325|            chat_name=use_id,
    326|            chat_type="dm",
-   327|            user_id=user_id,
-   328|            user_name=user_id,
+   327|            use_id=use_id,
+   328|            use_name=use_id,
    329|        )
-   330|        return MessageEvent(
+   330|        etun MessageEvent(
    331|            text=content,
    332|            message_type=MessageType.TEXT,
-   333|            source=source,
-   334|            raw_message=xml_text,
+   333|            souce=souce,
+   334|            aw_message=xml_text,
    335|            message_id=msg_id,
    336|        )
    337|
-   338|    def _crypt_for_app(self, app: Dict[str, Any]) -> WXBizMsgCrypt:
-   339|        return WXBizMsgCrypt(
-   340|            token=str(app.get("token") or ""),
-   341|            encoding_aes_key=str(app.get("encoding_aes_key") or ""),
-   342|            receive_id=str(app.get("corp_id") or ""),
+   338|    def _cypt_fo_app(self, app: Dict[st, Any]) -> WXBizMsgCypt:
+   339|        etun WXBizMsgCypt(
+   340|            token=st(app.get("token") o ""),
+   341|            encoding_aes_key=st(app.get("encoding_aes_key") o ""),
+   342|            eceive_id=st(app.get("cop_id") o ""),
    343|        )
    344|
-   345|    def _get_app_by_name(self, name: Optional[str]) -> Optional[Dict[str, Any]]:
+   345|    def _get_app_by_name(self, name: Optional[st]) -> Optional[Dict[st, Any]]:
    346|        if not name:
-   347|            return None
-   348|        for app in self._apps:
+   347|            etun None
+   348|        fo app in self._apps:
    349|            if app.get("name") == name:
-   350|                return app
-   351|        return None
+   350|                etun app
+   351|        etun None
    352|
    353|    # ------------------------------------------------------------------
    354|    # Access-token management
    355|    # ------------------------------------------------------------------
    356|
-   357|    async def _get_access_token(self, app: Dict[str, Any]) -> str:
+   357|    async def _get_access_token(self, app: Dict[st, Any]) -> st:
    358|        cached = self._access_tokens.get(app["name"])
    359|        now = time.time()
-   360|        if cached and cached.get("expires_at", 0) > now + 60:
-   361|            return cached["token"]
-   362|        return await self._refresh_access_token(app)
+   360|        if cached and cached.get("expies_at", 0) > now + 60:
+   361|            etun cached["token"]
+   362|        etun await self._efesh_access_token(app)
    363|
-   364|    async def _refresh_access_token(self, app: Dict[str, Any]) -> str:
-   365|        resp = await self._http_client.get(
-   366|            "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
-   367|            params={
-   368|                "corpid": app.get("corp_id"),
-   369|                "corpsecret": app.get("corp_secret"),
+   364|    async def _efesh_access_token(self, app: Dict[st, Any]) -> st:
+   365|        esp = await self._http_client.get(
+   366|            "https:qyapi.weixin.qq.comcgi-bingettoken",
+   367|            paams={
+   368|                "copid": app.get("cop_id"),
+   369|                "copsecet": app.get("cop_secet"),
    370|            },
    371|        )
-   372|        data = resp.json()
-   373|        if data.get("errcode") != 0:
-   374|            raise RuntimeError(f"WeCom token refresh failed: {data}")
+   372|        data = esp.json()
+   373|        if data.get("ecode") != 0:
+   374|            aise RuntimeEo(f"WeCom token efesh failed: {data}")
    375|        token = data["access_token"]
-   376|        expires_in = int(data.get("expires_in", ACCESS_TOKEN_TTL_SECONDS))
+   376|        expies_in = int(data.get("expies_in", ACCESS_TOKEN_TTL_SECONDS))
    377|        self._access_tokens[app["name"]] = {
    378|            "token": token,
-   379|            "expires_at": time.time() + expires_in,
+   379|            "expies_at": time.time() + expies_in,
    380|        }
-   381|        logger.info(
-   382|            "[WecomCallback] Token refreshed for app '%s' (corp=%s), expires in %ss",
+   381|        logge.info(
+   382|            "[WecomCallback] Token efeshed fo app '%s' (cop=%s), expies in %ss",
    383|            app.get("name", "default"),
-   384|            app.get("corp_id", ""),
-   385|            expires_in,
+   384|            app.get("cop_id", ""),
+   385|            expies_in,
    386|        )
-   387|        return token
+   387|        etun token
    388|
