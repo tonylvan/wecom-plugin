@@ -264,6 +264,17 @@ class WeComAdapter(BasePlatformAdapter):
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+            self._heartbeat_task = None
+
+        self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
+        await self._cleanup_ws()
+
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
+        self._dedup.clear()
+        logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
@@ -274,31 +285,6 @@ class WeComAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
-
-    def _is_group_allowed(self, chat_id: str, sender_id: str) -> bool:
-        """
-        Check if a group chat message should be processed based on policy.
-        
-        Policies:
-        - "open": Allow all group messages (but still need @mention)
-        - "allowlist": Only allow from specific groups/members
-        - "disabled": Block all group messages
-        """
-        if self._group_policy == "disabled":
-            return False
-        
-        if self._group_policy == "allowlist":
-            # Check if group is in allowlist
-            if not _entry_matches(self._group_allow_from, chat_id):
-                return False
-            
-            # Check group-specific member allowlist
-            group_config = self._groups.get(chat_id, {})
-            group_allow = _coerce_list(group_config.get("allow_from"))
-            if group_allow and not _entry_matches(group_allow, sender_id):
-                return False
-        
-        return True
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
@@ -530,10 +516,9 @@ class WeComAdapter(BasePlatformAdapter):
             if not self._is_group_allowed(chat_id, sender_id):
                 logger.debug("[%s] Group %s / sender %s blocked by policy", self.name, chat_id, sender_id)
                 return
-
-        # 获取消息内容
-        content = str(body.get("content") or "").strip()
-        msg_type = str(body.get("msgtype") or "text").lower()
+        elif not self._is_dm_allowed(sender_id):
+            logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
+            return
 
         # 群聊中需要检查机器人是否被 @
         if is_group:
@@ -542,6 +527,7 @@ class WeComAdapter(BasePlatformAdapter):
             
             # 如果没有被 @，检查是否通过文本 @mention 匹配（多 Agent 模式）
             if not is_mentioned:
+                content = str(body.get("content") or "").strip()
                 target_agents = self._mention_router.resolve_target_agents(content)
                 if not target_agents:
                     logger.debug(
@@ -554,22 +540,1234 @@ class WeComAdapter(BasePlatformAdapter):
             else:
                 logger.debug("[%s] Bot was @mentioned in group chat %s", self.name, chat_id)
 
-        # 创建 MessageEvent 并处理消息
+        text, reply_text = self._extract_text(body)
+        media_urls, media_types = await self._extract_media(body)
+        message_type = self._derive_message_type(body, text, media_types)
+        has_reply_context = bool(reply_text and (text or media_urls))
+
+        if not text and reply_text and not media_urls:
+            text = reply_text
+
+        if not text and not media_urls:
+            logger.debug("[%s] Empty WeCom message skipped", self.name)
+            return
+
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=chat_id,
             chat_type="group" if is_group else "dm",
-            user_id=sender_id,
-            user_name=sender_id,
+            user_id=sender_id or None,
+            user_name=sender_id or None,
         )
-        
+
         event = MessageEvent(
-            text=content,
-            message_type=MessageType.TEXT,
+            text=text,
+            message_type=message_type,
             source=source,
-            raw_message=body,
+            raw_message=payload,
             message_id=msg_id,
+            media_urls=media_urls,
+            media_types=media_types,
+            reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None,
+            reply_to_text=reply_text if has_reply_context else None,
+            timestamp=datetime.now(tz=timezone.utc),
         )
+
+        # Only batch plain text messages — commands, media, etc. dispatch
+        # immediately since they won't be split by the WeCom client.
+        if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
+            self._enqueue_text_event(event)
+        else:
+            # Multi-agent dispatch: if group chat and multi-agent is enabled,
+            # route to the appropriate agent(s) before calling handle_message.
+            if is_group and self._mention_router.enabled and self._mention_router.cross_agent_enabled:
+                await self._dispatch_group_multi_agent(event, sender_id)
+            else:
+                await self.handle_message(event)
+
+    # ------------------------------------------------------------------
+    # Text message aggregation (handles WeCom client-side splits)
+    # ------------------------------------------------------------------
+
+    def _text_batch_key(self, event: MessageEvent) -> str:
+        """Session-scoped key for text message batching."""
+        from gateway.session import build_session_key
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
+        """Buffer a text event and reset the flush timer.
+
+        When WeCom splits a long user message at 4000 chars, the chunks
+        arrive within a few hundred milliseconds.  This merges them into
+        a single event before dispatching.
+        """
+        key = self._text_batch_key(event)
+        existing = self._pending_text_batches.get(key)
+        chunk_len = len(event.text or "")
+        if existing is None:
+            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            self._pending_text_batches[key] = event
+        else:
+            if event.text:
+                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            # Merge any media that might be attached
+            if event.media_urls:
+                existing.media_urls.extend(event.media_urls)
+                existing.media_types.extend(event.media_types)
+
+        # Cancel any pending flush and restart the timer
+        prior_task = self._pending_text_batch_tasks.get(key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+        self._pending_text_batch_tasks[key] = asyncio.create_task(
+            self._flush_text_batch(key)
+        )
+
+    async def _flush_text_batch(self, key: str) -> None:
+        """Wait for the quiet period then dispatch the aggregated text.
+
+        Uses a longer delay when the latest chunk is near WeCom's 4000-char
+        split point, since a continuation chunk is almost certain.
+        """
+        current_task = asyncio.current_task()
+        try:
+            pending = self._pending_text_batches.get(key)
+            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+            if last_len >= self._SPLIT_THRESHOLD:
+                delay = self._text_batch_split_delay_seconds
+            else:
+                delay = self._text_batch_delay_seconds
+            await asyncio.sleep(delay)
+            event = self._pending_text_batches.pop(key, None)
+            if not event:
+                return
+            logger.info(
+                "[WeCom] Flushing text batch %s (%d chars)",
+                key, len(event.text or ""),
+            )
+            await self.handle_message(event)
+        finally:
+            if self._pending_text_batch_tasks.get(key) is current_task:
+                self._pending_text_batch_tasks.pop(key, None)
+
+    @staticmethod
+    def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        """Extract plain text and quoted text from a callback payload."""
+        text_parts: List[str] = []
+        reply_text: Optional[str] = None
+        msgtype = str(body.get("msgtype") or "").lower()
+
+        if msgtype == "mixed":
+            mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
+            items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("msgtype") or "").lower() == "text":
+                    text_block = item.get("text") if isinstance(item.get("text"), dict) else {}
+                    content = str(text_block.get("content") or "").strip()
+                    if content:
+                        text_parts.append(content)
+        else:
+            text_block = body.get("text") if isinstance(body.get("text"), dict) else {}
+            content = str(text_block.get("content") or "").strip()
+            if content:
+                text_parts.append(content)
+
+            if msgtype == "voice":
+                voice_block = body.get("voice") if isinstance(body.get("voice"), dict) else {}
+                voice_text = str(voice_block.get("content") or "").strip()
+                if voice_text:
+                    text_parts.append(voice_text)
+
+            # Extract appmsg title (filename) for WeCom AI Bot attachments
+            if msgtype == "appmsg":
+                appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
+                title = str(appmsg.get("title") or "").strip()
+                if title:
+                    text_parts.append(title)
+
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        quote_type = str(quote.get("msgtype") or "").lower()
+        if quote_type == "text":
+            quote_text = quote.get("text") if isinstance(quote.get("text"), dict) else {}
+            reply_text = str(quote_text.get("content") or "").strip() or None
+        elif quote_type == "voice":
+            quote_voice = quote.get("voice") if isinstance(quote.get("voice"), dict) else {}
+            reply_text = str(quote_voice.get("content") or "").strip() or None
+
+        return "\n".join(part for part in text_parts if part).strip(), reply_text
+
+    async def _extract_media(self, body: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+        """Best-effort extraction of inbound media to local cache paths."""
+        media_paths: List[str] = []
+        media_types: List[str] = []
+        refs: List[Tuple[str, Dict[str, Any]]] = []
+        msgtype = str(body.get("msgtype") or "").lower()
+
+        if msgtype == "mixed":
+            mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
+            items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("msgtype") or "").lower()
+                if item_type == "image" and isinstance(item.get("image"), dict):
+                    refs.append(("image", item["image"]))
+        else:
+            if isinstance(body.get("image"), dict):
+                refs.append(("image", body["image"]))
+            if msgtype == "file" and isinstance(body.get("file"), dict):
+                refs.append(("file", body["file"]))
+            # Handle appmsg (WeCom AI Bot attachments with PDF/Word/Excel)
+            if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+                appmsg = body["appmsg"]
+                if isinstance(appmsg.get("file"), dict):
+                    refs.append(("file", appmsg["file"]))
+                elif isinstance(appmsg.get("image"), dict):
+                    refs.append(("image", appmsg["image"]))
+
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        quote_type = str(quote.get("msgtype") or "").lower()
+        if quote_type == "image" and isinstance(quote.get("image"), dict):
+            refs.append(("image", quote["image"]))
+        elif quote_type == "file" and isinstance(quote.get("file"), dict):
+            refs.append(("file", quote["file"]))
+
+        for kind, ref in refs:
+            cached = await self._cache_media(kind, ref)
+            if cached:
+                path, content_type = cached
+                media_paths.append(path)
+                media_types.append(content_type)
+
+        return media_paths, media_types
+
+    async def _cache_media(self, kind: str, media: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        """Cache an inbound image/file/media reference to local storage."""
+        if "base64" in media and media.get("base64"):
+            try:
+                raw = self._decode_base64(media["base64"])
+            except Exception as exc:
+                logger.debug("[%s] Failed to decode %s base64 media: %s", self.name, kind, exc)
+                return None
+
+            if kind == "image":
+                ext = self._detect_image_ext(raw)
+                try:
+                    return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
+                except ValueError as exc:
+                    logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
+                    return None
+
+            filename = str(media.get("filename") or media.get("name") or "wecom_file")
+            return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        url = str(media.get("url") or "").strip()
+        if not url:
+            return None
+
+        try:
+            raw, headers = await self._download_remote_bytes(url, max_bytes=ABSOLUTE_MAX_BYTES)
+        except Exception as exc:
+            logger.debug("[%s] Failed to download %s from %s: %s", self.name, kind, url, exc)
+            return None
+
+        aes_key = str(media.get("aeskey") or "").strip()
+        if aes_key:
+            try:
+                raw = self._decrypt_file_bytes(raw, aes_key)
+            except Exception as exc:
+                logger.debug("[%s] Failed to decrypt %s from %s: %s", self.name, kind, url, exc)
+                return None
+
+        content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
+        if kind == "image":
+            ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
+            try:
+                return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+            except ValueError as exc:
+                logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
+                return None
+
+        filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
+        return cache_document_from_bytes(raw, filename), content_type
+
+    @staticmethod
+    def _decode_base64(data: str) -> bytes:
+        payload = data.split(",", 1)[-1].strip()
+        return base64.b64decode(payload)
+
+    @staticmethod
+    def _detect_image_ext(data: bytes) -> str:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return ".webp"
+        return ".jpg"
+
+    @staticmethod
+    def _mime_for_ext(ext: str, fallback: str = "application/octet-stream") -> str:
+        return mimetypes.types_map.get(ext.lower(), fallback)
+
+    @staticmethod
+    def _guess_extension(url: str, content_type: str, fallback: str) -> str:
+        ext = mimetypes.guess_extension(content_type) if content_type else None
+        if ext:
+            return ext
+        path_ext = Path(urlparse(url).path).suffix
+        if path_ext:
+            return path_ext
+        return fallback
+
+    @staticmethod
+    def _guess_filename(url: str, content_disposition: Optional[str], content_type: str) -> str:
+        if content_disposition:
+            match = re.search(r'filename="?([^";]+)"?', content_disposition)
+            if match:
+                return match.group(1)
+
+        name = Path(urlparse(url).path).name or "document"
+        if "." not in name:
+            ext = mimetypes.guess_extension(content_type) or ".bin"
+            name = f"{name}{ext}"
+        return name
+
+    @staticmethod
+    def _derive_message_type(body: Dict[str, Any], text: str, media_types: List[str]) -> MessageType:
+        """Choose the normalized inbound message type."""
+        if any(mtype.startswith(("application/", "text/")) for mtype in media_types):
+            return MessageType.DOCUMENT
+        if any(mtype.startswith("image/") for mtype in media_types):
+            return MessageType.TEXT if text else MessageType.PHOTO
+        if str(body.get("msgtype") or "").lower() == "voice":
+            return MessageType.VOICE
+        return MessageType.TEXT
+
+    # ------------------------------------------------------------------
+    # Policy helpers
+    # ------------------------------------------------------------------
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return _entry_matches(self._allow_from, sender_id)
+        return True
+
+    def _is_group_allowed(self, chat_id: str, sender_id: str) -> bool:
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "allowlist" and not _entry_matches(self._group_allow_from, chat_id):
+            return False
+
+        group_cfg = self._resolve_group_cfg(chat_id)
+        sender_allow = _coerce_list(group_cfg.get("allow_from") or group_cfg.get("allowFrom"))
+        if sender_allow:
+            return _entry_matches(sender_allow, sender_id)
+        return True
+
+    def _resolve_group_cfg(self, chat_id: str) -> Dict[str, Any]:
+        if not isinstance(self._groups, dict):
+            return {}
+        if chat_id in self._groups and isinstance(self._groups[chat_id], dict):
+            return self._groups[chat_id]
+        lowered = chat_id.lower()
+        for key, value in self._groups.items():
+            if isinstance(key, str) and key.lower() == lowered and isinstance(value, dict):
+                return value
+        wildcard = self._groups.get("*")
+        return wildcard if isinstance(wildcard, dict) else {}
+
+    def _remember_reply_req_id(self, message_id: str, req_id: str) -> None:
+        normalized_message_id = str(message_id or "").strip()
+        normalized_req_id = str(req_id or "").strip()
+        if not normalized_message_id or not normalized_req_id:
+            return
+        self._reply_req_ids[normalized_message_id] = normalized_req_id
+        while len(self._reply_req_ids) > DEDUP_MAX_SIZE:
+            self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
+
+    def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
+        normalized = str(reply_to or "").strip()
+        if not normalized or normalized.startswith("quote:"):
+            return None
+        return self._reply_req_ids.get(normalized)
+
+    # ------------------------------------------------------------------
+    # Multi-agent group chat dispatch
+    # ------------------------------------------------------------------
+
+    async def _dispatch_group_multi_agent(
+        self,
+        event: "MessageEvent",
+        sender_id: str,
+    ) -> None:
+        """Route a group chat message to the appropriate agent(s) based on @mentions.
+
+        Flow:
+        1. Parse @mentions to determine target agent(s)
+        2. For each target agent, invoke the message handler
+        3. If the response contains @mention of another agent, chain automatically
+        4. Send all responses to the group chat
+        """
+        from gateway.platforms.group_session import (
+            get_group_session_store,
+            AgentTurnRecord,
+        )
+        import time as _time
+
+        chat_id = event.source.chat_id
+        text = event.text or ""
+        router = self._mention_router
+
+        # Determine target agents from @mentions
+        target_agent_ids = router.resolve_target_agents(text)
+        if not target_agent_ids:
+            # No mention — use default agent
+            target_agent_ids = [router.default_agent_id]
+
+        # Filter to only configured agents
+        target_agent_ids = [
+            aid for aid in target_agent_ids
+            if router.get_agent_config(aid) is not None
+        ]
+        if not target_agent_ids:
+            # Fallback to normal flow
+            await self.handle_message(event)
+            return
+
+        # Get or create the discussion chain
+        store = get_group_session_store()
+        chain = await store.get_or_create_chain(
+            chat_id=chat_id,
+            user_message=text,
+            sender_id=sender_id,
+            max_chain_length=router.max_chain_length,
+            cooldown_seconds=router.chain_cooldown_seconds,
+        )
+
+        # Check if chain was already interrupted by user
+        if chain.interrupted_by_user:
+            await store.clear_chain(chat_id)
+            await self.handle_message(event)
+            return
+
+        # Process each target agent sequentially
+        all_responses: List[str] = []
+        for agent_id in target_agent_ids:
+            agent_cfg = router.get_agent_config(agent_id)
+            if agent_cfg is None:
+                continue
+
+            # Build conversation context from previous turns
+            context_lines = []
+            if chain.turn_records:
+                context_lines.append(
+                    f"[System] This is a group discussion. "
+                    f"Previous conversation:"
+                )
+                context_lines.append(chain.get_conversation_context())
+                context_lines.append(
+                    f"\
+[System] Your turn to respond as {agent_cfg.name}."
+                )
+
+            # Prepend context to user message for this agent
+            if context_lines:
+                enriched_text = "\
+\
+".join(context_lines) + "\
+\
+" + text
+            else:
+                enriched_text = text
+
+            logger.info(
+                "[WeCom Multi-Agent] Dispatching to agent '%s' (name: '%s') "
+                "in group %s",
+                agent_id, agent_cfg.name, chat_id,
+            )
+
+            # Create a synthetic event with enriched context
+            enriched_event = MessageEvent(
+                text=enriched_text,
+                message_type=event.message_type,
+                source=event.source,
+                raw_message=event.raw_message,
+                message_id=event.message_id,
+                media_urls=event.media_urls,
+                media_types=event.media_types,
+                reply_to_message_id=event.reply_to_message_id,
+                reply_to_text=event.reply_to_text,
+                timestamp=event.timestamp,
+            )
+            # Signal the gateway to skip its own response delivery —
+            # the WeComAdapter sends responses with agent name prefixes.
+            enriched_event._skip_delivery = True  # type: ignore[attr-defined]
+
+            # Invoke the message handler (this runs the agent)
+            response_text = await self.handle_message(enriched_event)
+            if response_text:
+                all_responses.append(response_text)
+
+                # Record this turn
+                turn = AgentTurnRecord(
+                    agent_id=agent_id,
+                    agent_name=agent_cfg.name,
+                    request_text=text,
+                    response_text=response_text,
+                    mentions_in_response=[],
+                    started_at=_time.time(),
+                    completed_at=_time.time(),
+                )
+                chain.add_turn(turn)
+
+                # Send response to group chat with agent name prefix
+                send_text = f"**{agent_cfg.name}**\
+\
+{response_text}"
+                await self.send(
+                    chat_id=chat_id,
+                    content=send_text,
+                    reply_to=event.message_id,
+                )
+
+        # After all targets respond, check for cross-agent chain
+        await self._process_cross_agent_chain(
+            chat_id=chat_id,
+            original_event=event,
+            chain=chain,
+        )
+
+    async def _process_cross_agent_chain(
+        self,
+        chat_id: str,
+        original_event: "MessageEvent",
+        chain,
+    ) -> None:
+        """Check the latest agent response for @mentions of other agents
+        and automatically trigger them (cross-agent chaining)."""
+        from gateway.platforms.group_session import (
+            get_group_session_store,
+            AgentTurnRecord,
+        )
+        import time as _time
+
+        if not chain.turn_records:
+            return
+
+        router = self._mention_router
+        store = get_group_session_store()
+
+        # Scan the last turn's response for @mentions
+        last_turn = chain.turn_records[-1]
+        mentioned_agents = router.extract_mentions_from_response(
+            last_turn.response_text
+        )
+
+        # Filter out already-triggered agents
+        already_triggered = set(chain.triggered_agents)
+        next_agents = [
+            aid for aid in mentioned_agents
+            if aid not in already_triggered
+            and router.get_agent_config(aid) is not None
+        ]
+
+        if not next_agents:
+            # No new agents to chain — mark complete
+            await store.complete_chain(chat_id)
+            await store.clear_chain(chat_id)
+            return
+
+        # Trigger each next agent in sequence
+        for agent_id in next_agents:
+            if not chain.can_trigger_next(agent_id):
+                logger.info(
+                    "[WeCom Multi-Agent] Skipping agent '%s' — chain limit or cooldown",
+                    agent_id,
+                )
+                continue
+
+            agent_cfg = router.get_agent_config(agent_id)
+            if agent_cfg is None:
+                continue
+
+            logger.info(
+                "[WeCom Multi-Agent] Cross-agent chain: '%s' -> '%s' "
+                "(depth %d/%d)",
+                last_turn.agent_id, agent_id,
+                chain.chain_depth + 1, chain.max_chain_length,
+            )
+
+            # Build full conversation context
+            context = chain.get_conversation_context()
+            enriched_text = (
+                f"[System] A colleague @{agent_cfg.name} asked you to respond. "
+                f"Here is the full conversation so far:\
+\
+{context}\
+\
+"
+                f"Please respond as {agent_cfg.name}."
+            )
+
+            enriched_event = MessageEvent(
+                text=enriched_text,
+                message_type=original_event.message_type,
+                source=original_event.source,
+                raw_message=original_event.raw_message,
+                message_id=original_event.message_id,
+                media_urls=original_event.media_urls,
+                media_types=original_event.media_types,
+                reply_to_message_id=original_event.reply_to_message_id,
+                reply_to_text=original_event.reply_to_text,
+                timestamp=original_event.timestamp,
+            )
+            enriched_event._skip_delivery = True  # type: ignore[attr-defined]
+
+            response_text = await self.handle_message(enriched_event)
+            if response_text:
+                turn = AgentTurnRecord(
+                    agent_id=agent_id,
+                    agent_name=agent_cfg.name,
+                    request_text=context,
+                    response_text=response_text,
+                    mentions_in_response=[],
+                    started_at=_time.time(),
+                    completed_at=_time.time(),
+                )
+                chain.add_turn(turn)
+
+                send_text = f"**{agent_cfg.name}**\
+\
+{response_text}"
+                await self.send(
+                    chat_id=chat_id,
+                    content=send_text,
+                    reply_to=original_event.message_id,
+                )
+
+        # After chain, check if there are more agents to trigger recursively
+        if chain.turn_records:
+            latest_response = chain.turn_records[-1].response_text
+            more_mentions = router.extract_mentions_from_response(latest_response)
+            still_pending = [
+                aid for aid in more_mentions
+                if aid not in set(chain.triggered_agents)
+                and router.get_agent_config(aid) is not None
+            ]
+            if still_pending and chain.chain_depth < chain.max_chain_length:
+                # Recurse for further chaining
+                await self._process_cross_agent_chain(
+                    chat_id=chat_id,
+                    original_event=original_event,
+                    chain=chain,
+                )
+            else:
+                await store.complete_chain(chat_id)
+                await store.clear_chain(chat_id)
+        else:
+            await store.complete_chain(chat_id)
+            await store.clear_chain(chat_id)
+
+    # ------------------------------------------------------------------
+    # Outbound messaging
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _guess_mime_type(filename: str) -> str:
+        mime_type = mimetypes.guess_type(filename)[0]
+        if mime_type:
+            return mime_type
+        if Path(filename).suffix.lower() == ".amr":
+            return "audio/amr"
+        return "application/octet-stream"
+
+    @staticmethod
+    def _normalize_content_type(content_type: str, filename: str) -> str:
+        normalized = str(content_type or "").split(";", 1)[0].strip().lower()
+        guessed = WeComAdapter._guess_mime_type(filename)
+        if not normalized:
+            return guessed
+        if normalized in {"application/octet-stream", "text/plain"}:
+            return guessed
+        return normalized
+
+    @staticmethod
+    def _detect_wecom_media_type(content_type: str) -> str:
+        mime_type = str(content_type or "").strip().lower()
+        if mime_type.startswith("image/"):
+            return "image"
+        if mime_type.startswith("video/"):
+            return "video"
+        if mime_type.startswith("audio/") or mime_type == "application/ogg":
+            return "voice"
+        return "file"
+
+    @staticmethod
+    def _apply_file_size_limits(file_size: int, detected_type: str, content_type: Optional[str] = None) -> Dict[str, Any]:
+        file_size_mb = file_size / (1024 * 1024)
+        normalized_type = str(detected_type or "file").lower()
+        normalized_content_type = str(content_type or "").strip().lower()
+
+        if file_size > ABSOLUTE_MAX_BYTES:
+            return {
+                "final_type": normalized_type,
+                "rejected": True,
+                "reject_reason": (
+                    f"文件大小 {file_size_mb:.2f}MB 超过了企业微信允许的最大限制 20MB，无法发送。"
+                    "请尝试压缩文件或减小文件大小。"
+                ),
+                "downgraded": False,
+                "downgrade_note": None,
+            }
+
+        if normalized_type == "image" and file_size > IMAGE_MAX_BYTES:
+            return {
+                "final_type": "file",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": True,
+                "downgrade_note": f"图片大小 {file_size_mb:.2f}MB 超过 10MB 限制，已转为文件格式发送",
+            }
+
+        if normalized_type == "video" and file_size > VIDEO_MAX_BYTES:
+            return {
+                "final_type": "file",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": True,
+                "downgrade_note": f"视频大小 {file_size_mb:.2f}MB 超过 10MB 限制，已转为文件格式发送",
+            }
+
+        if normalized_type == "voice":
+            if normalized_content_type and normalized_content_type not in VOICE_SUPPORTED_MIMES:
+                return {
+                    "final_type": "file",
+                    "rejected": False,
+                    "reject_reason": None,
+                    "downgraded": True,
+                    "downgrade_note": (
+                        f"语音格式 {normalized_content_type} 不支持，企微仅支持 AMR 格式，已转为文件格式发送"
+                    ),
+                }
+            if file_size > VOICE_MAX_BYTES:
+                return {
+                    "final_type": "file",
+                    "rejected": False,
+                    "reject_reason": None,
+                    "downgraded": True,
+                    "downgrade_note": f"语音大小 {file_size_mb:.2f}MB 超过 2MB 限制，已转为文件格式发送",
+                }
+
+        return {
+            "final_type": normalized_type,
+            "rejected": False,
+            "reject_reason": None,
+            "downgraded": False,
+            "downgrade_note": None,
+        }
+
+    @staticmethod
+    def _response_error(response: Dict[str, Any]) -> Optional[str]:
+        errcode = response.get("errcode", 0)
+        if errcode in (0, None):
+            return None
+        errmsg = str(response.get("errmsg") or "unknown error")
+        return f"WeCom errcode {errcode}: {errmsg}"
+
+    @classmethod
+    def _raise_for_wecom_error(cls, response: Dict[str, Any], operation: str) -> None:
+        error = cls._response_error(response)
+        if error:
+            raise RuntimeError(f"{operation} failed: {error}")
+
+    @staticmethod
+    def _decrypt_file_bytes(encrypted_data: bytes, aes_key: str) -> bytes:
+        if not encrypted_data:
+            raise ValueError("encrypted_data is empty")
+        if not aes_key:
+            raise ValueError("aes_key is required")
+
+        key = base64.b64decode(aes_key)
+        if len(key) != 32:
+            raise ValueError(f"Invalid WeCom AES key length: expected 32 bytes, got {len(key)}")
+
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        except ImportError as exc:  # pragma: no cover - dependency is environment-specific
+            raise RuntimeError("cryptography is required for WeCom media decryption") from exc
+
+        cipher = Cipher(algorithms.AES(key), modes.CBC(key[:16]))
+        decryptor = cipher.decryptor()
+        decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
+
+        pad_len = decrypted[-1]
+        if pad_len < 1 or pad_len > 32 or pad_len > len(decrypted):
+            raise ValueError(f"Invalid PKCS#7 padding value: {pad_len}")
+        if any(byte != pad_len for byte in decrypted[-pad_len:]):
+            raise ValueError("Invalid PKCS#7 padding: padding bytes mismatch")
+
+        return decrypted[:-pad_len]
+
+    async def _download_remote_bytes(
+        self,
+        url: str,
+        max_bytes: int,
+    ) -> Tuple[bytes, Dict[str, str]]:
+        from tools.url_safety import is_safe_url
+        if not is_safe_url(url):
+            raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
+
+        if not HTTPX_AVAILABLE:
+            raise RuntimeError("httpx is required for WeCom media download")
+
+        client = self._http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        created_client = client is not self._http_client
+        try:
+            async with client.stream(
+                "GET",
+                url,
+                headers={
+                    "User-Agent": "HermesAgent/1.0",
+                    "Accept": "*/*",
+                },
+            ) as response:
+                response.raise_for_status()
+                headers = {key.lower(): value for key, value in response.headers.items()}
+                content_length = headers.get("content-length")
+                if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds WeCom limit: {int(content_length)} bytes > {max_bytes} bytes"
+                    )
+
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise ValueError(
+                            f"Remote media exceeds WeCom limit while downloading: {len(data)} bytes > {max_bytes} bytes"
+                        )
+
+                return bytes(data), headers
+        finally:
+            if created_client:
+                await client.aclose()
+
+    @staticmethod
+    def _looks_like_url(media_source: str) -> bool:
+        parsed = urlparse(str(media_source or ""))
+        return parsed.scheme in {"http", "https"}
+
+    async def _load_outbound_media(
+        self,
+        media_source: str,
+        file_name: Optional[str] = None,
+    ) -> Tuple[bytes, str, str]:
+        source = str(media_source or "").strip()
+        if not source:
+            raise ValueError("media source is required")
+        if re.fullmatch(r"<[^>\n]+>", source):
+            raise ValueError(f"Media placeholder was not replaced with a real file path: {source}")
+
+        parsed = urlparse(source)
+        if parsed.scheme in {"http", "https"}:
+            data, headers = await self._download_remote_bytes(source, max_bytes=ABSOLUTE_MAX_BYTES)
+            content_disposition = headers.get("content-disposition")
+            resolved_name = file_name or self._guess_filename(source, content_disposition, headers.get("content-type", ""))
+            content_type = self._normalize_content_type(headers.get("content-type", ""), resolved_name)
+            return data, content_type, resolved_name
+
+        if parsed.scheme == "file":
+            local_path = Path(unquote(parsed.path)).expanduser()
+        else:
+            local_path = Path(source).expanduser()
+
+        if not local_path.is_absolute():
+            local_path = (Path.cwd() / local_path).resolve()
+
+        if not local_path.exists() or not local_path.is_file():
+            raise FileNotFoundError(f"Media file not found: {local_path}")
+
+        data = local_path.read_bytes()
+        resolved_name = file_name or local_path.name
+        content_type = self._normalize_content_type("", resolved_name)
+        return data, content_type, resolved_name
+
+    async def _prepare_outbound_media(
+        self,
+        media_source: str,
+        file_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        data, content_type, resolved_name = await self._load_outbound_media(media_source, file_name=file_name)
+        detected_type = self._detect_wecom_media_type(content_type)
+        size_check = self._apply_file_size_limits(len(data), detected_type, content_type)
+        return {
+            "data": data,
+            "content_type": content_type,
+            "file_name": resolved_name,
+            "detected_type": detected_type,
+            **size_check,
+        }
+
+    async def _upload_media_bytes(self, data: bytes, media_type: str, filename: str) -> Dict[str, Any]:
+        if not data:
+            raise ValueError("Cannot upload empty media")
+
+        total_size = len(data)
+        total_chunks = (total_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
+        if total_chunks > MAX_UPLOAD_CHUNKS:
+            raise ValueError(
+                f"File too large: {total_chunks} chunks exceeds maximum of {MAX_UPLOAD_CHUNKS} chunks"
+            )
+
+        init_response = await self._send_request(
+            APP_CMD_UPLOAD_MEDIA_INIT,
+            {
+                "type": media_type,
+                "filename": filename,
+                "total_size": total_size,
+                "total_chunks": total_chunks,
+                "md5": hashlib.md5(data).hexdigest(),
+            },
+        )
+        self._raise_for_wecom_error(init_response, "media upload init")
+
+        init_body = init_response.get("body") if isinstance(init_response.get("body"), dict) else {}
+        upload_id = str(init_body.get("upload_id") or "").strip()
+        if not upload_id:
+            raise RuntimeError(f"media upload init failed: missing upload_id in response {init_response}")
+
+        for chunk_index, start in enumerate(range(0, total_size, UPLOAD_CHUNK_SIZE)):
+            chunk = data[start : start + UPLOAD_CHUNK_SIZE]
+            chunk_response = await self._send_request(
+                APP_CMD_UPLOAD_MEDIA_CHUNK,
+                {
+                    "upload_id": upload_id,
+                    # Match the official SDK implementation, which currently uses 0-based chunk indexes.
+                    "chunk_index": chunk_index,
+                    "base64_data": base64.b64encode(chunk).decode("ascii"),
+                },
+            )
+            self._raise_for_wecom_error(chunk_response, f"media upload chunk {chunk_index}")
+
+        finish_response = await self._send_request(
+            APP_CMD_UPLOAD_MEDIA_FINISH,
+            {"upload_id": upload_id},
+        )
+        self._raise_for_wecom_error(finish_response, "media upload finish")
+
+        finish_body = finish_response.get("body") if isinstance(finish_response.get("body"), dict) else {}
+        media_id = str(finish_body.get("media_id") or "").strip()
+        if not media_id:
+            raise RuntimeError(f"media upload finish failed: missing media_id in response {finish_response}")
+
+        return {
+            "type": str(finish_body.get("type") or media_type),
+            "media_id": media_id,
+            "created_at": finish_body.get("created_at"),
+        }
+
+    async def _send_media_message(self, chat_id: str, media_type: str, media_id: str) -> Dict[str, Any]:
+        response = await self._send_request(
+            APP_CMD_SEND,
+            {
+                "chatid": chat_id,
+                "msgtype": media_type,
+                media_type: {"media_id": media_id},
+            },
+        )
+        self._raise_for_wecom_error(response, "send media message")
+        return response
+
+    async def _send_reply_stream(self, reply_req_id: str, content: str) -> Dict[str, Any]:
+        response = await self._send_reply_request(
+            reply_req_id,
+            {
+                "msgtype": "stream",
+                "stream": {
+                    "id": self._new_req_id("stream"),
+                    "finish": True,
+                    "content": content[:self.MAX_MESSAGE_LENGTH],
+                },
+            },
+        )
+        self._raise_for_wecom_error(response, "send reply stream")
+        return response
+
+    async def _send_reply_media_message(
+        self,
+        reply_req_id: str,
+        media_type: str,
+        media_id: str,
+    ) -> Dict[str, Any]:
+        response = await self._send_reply_request(
+            reply_req_id,
+            {
+                "msgtype": media_type,
+                media_type: {"media_id": media_id},
+            },
+        )
+        self._raise_for_wecom_error(response, "send reply media message")
+        return response
+
+    async def _send_followup_markdown(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+    ) -> Optional[SendResult]:
+        if not content:
+            return None
+        result = await self.send(chat_id=chat_id, content=content, reply_to=reply_to)
+        if not result.success:
+            logger.warning("[%s] Follow-up markdown send failed: %s", self.name, result.error)
+        return result
+
+    async def _send_media_source(
+        self,
+        chat_id: str,
+        media_source: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        if not chat_id:
+            return SendResult(success=False, error="chat_id is required")
+
+        try:
+            prepared = await self._prepare_outbound_media(media_source, file_name=file_name)
+        except FileNotFoundError as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            logger.error("[%s] Failed to prepare outbound media %s: %s", self.name, media_source, exc)
+            return SendResult(success=False, error=str(exc))
+
+        if prepared["rejected"]:
+            await self._send_followup_markdown(
+                chat_id,
+                f"⚠️ {prepared['reject_reason']}",
+                reply_to=reply_to,
+            )
+            return SendResult(success=False, error=prepared["reject_reason"])
+
+        reply_req_id = self._reply_req_id_for_message(reply_to)
+        try:
+            upload_result = await self._upload_media_bytes(
+                prepared["data"],
+                prepared["final_type"],
+                prepared["file_name"],
+            )
+            if reply_req_id:
+                media_response = await self._send_reply_media_message(
+                    reply_req_id,
+                    prepared["final_type"],
+                    upload_result["media_id"],
+                )
+            else:
+                media_response = await self._send_media_message(
+                    chat_id,
+                    prepared["final_type"],
+                    upload_result["media_id"],
+                )
+        except asyncio.TimeoutError:
+            return SendResult(success=False, error="Timeout sending media to WeCom")
+        except Exception as exc:
+            logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
+            return SendResult(success=False, error=str(exc))
+
+        caption_result = None
+        downgrade_result = None
+        if caption:
+            caption_result = await self._send_followup_markdown(
+                chat_id,
+                caption,
+                reply_to=reply_to,
+            )
+        if prepared["downgraded"] and prepared["downgrade_note"]:
+            downgrade_result = await self._send_followup_markdown(
+                chat_id,
+                f"ℹ️ {prepared['downgrade_note']}",
+                reply_to=reply_to,
+            )
+
+        return SendResult(
+            success=True,
+            message_id=self._payload_req_id(media_response) or uuid.uuid4().hex[:12],
+            raw_response={
+                "upload": upload_result,
+                "media": media_response,
+                "caption": caption_result.raw_response if caption_result else None,
+                "caption_error": caption_result.error if caption_result and not caption_result.success else None,
+                "downgrade": downgrade_result.raw_response if downgrade_result else None,
+                "downgrade_error": downgrade_result.error if downgrade_result and not downgrade_result.success else None,
+            },
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send markdown to a WeCom chat via proactive ``aibot_send_msg``.
         
-        # 调用 handle_message 处理消息
-        await self.handle_message(event)
+        Supports ``mention_userids`` in metadata to @mention users in group chats.
+        For markdown messages, injects ``<@userid>`` into the content.
+        For text/reply messages, uses ``mentioned_list`` in the payload.
+        DM conversations are unaffected — metadata is simply ignored when
+        ``mention_userids`` is absent.
+        """
+        mention_names: List[str] = []
+        if metadata and isinstance(metadata, dict):
+            raw = metadata.get("mention_names") or metadata.get("mention_userids")
+            if raw:
+                mention_names = raw if isinstance(raw, list) else [str(raw)]
+
+        if not chat_id:
+            return SendResult(success=False, error="chat_id is required")
+
+        # Inject @nickname markers for group chat mentions
+        if mention_names:
+            mention_tags = " ".join(f"@{n}" for n in mention_names)
+            content = f"{mention_tags}\n{content}"
+
+        try:
+            reply_req_id = self._reply_req_id_for_message(reply_to)
+            if reply_req_id:
+                response = await self._send_reply_stream(reply_req_id, content)
+            else:
+                payload: Dict[str, Any] = {
+                    "chatid": chat_id,
+                    "msgtype": "markdown",
+                    "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                }
+                # Also add mentioned_list for API-level mention support
+                if mention_names:
+                    payload["mentioned_list"] = mention_names
+                response = await self._send_request(APP_CMD_SEND, payload)
+        except asyncio.TimeoutError:
+            return SendResult(success=False, error="Timeout sending message to WeCom")
+        except Exception as exc:
+            logger.error("[%s] Send failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+        error = self._response_error(response)
+        if error:
+            return SendResult(success=False, error=error)
+
+        return SendResult(
+            success=True,
+            message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+            raw_response=response,
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del metadata
+
+        result = await self._send_media_source(
+            chat_id=chat_id,
+            media_source=image_url,
+            caption=caption,
+            reply_to=reply_to,
+        )
+        if result.success or not self._looks_like_url(image_url):
+            return result
+
+        logger.warning("[%s] Falling back to text send for image URL %s: %s", self.name, image_url, result.error)
+        fallback_text = f"{caption}\n{image_url}" if caption else image_url
+        return await self.send(chat_id=chat_id, content=fallback_text, reply_to=reply_to)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id=chat_id,
+            media_source=image_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id=chat_id,
+            media_source=file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id=chat_id,
+            media_source=audio_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id=chat_id,
+            media_source=video_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """WeCom does not expose typing indicators in this adapter."""
+        del chat_id, metadata
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """Return minimal chat info."""
+        return {
+            "name": chat_id,
+            "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm",
+        }
