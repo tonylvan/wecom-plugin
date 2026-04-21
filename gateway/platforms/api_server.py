@@ -1,3 +1,4 @@
+import aiohttp
 """
 OpenAI-compatible API server platform adapter.
 
@@ -45,6 +46,8 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms.mention_router import MentionRouter
+from gateway.platforms.group_session import get_group_session_store, AgentTurnRecord
 
 logger = logging.getLogger(__name__)
 
@@ -373,8 +376,10 @@ class APIServerAdapter(BasePlatformAdapter):
     and routes them through hermes-agent's AIAgent.
     """
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, **kwargs):
         super().__init__(config, Platform.API_SERVER)
+        # Accept gateway_runner kwarg (passed by run.py) for cross-agent access
+        self._gateway_runner = kwargs.get("gateway_runner")
         extra = config.extra or {}
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         self._port: int = int(extra.get("port", os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))))
@@ -394,6 +399,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+
+        # Cross-agent peers — loaded from config.yaml cross_agent section
+        self._cross_agent_peers: List[Dict[str, str]] = []
+        self._load_cross_agent_peers()
+
+        # MentionRouter for parsing @mentions in cross-agent responses
+        self._mention_router: Optional[MentionRouter] = None
+        self._init_mention_router()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -459,6 +472,86 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         return "*" in self._cors_origins or origin in self._cors_origins
+
+    # ------------------------------------------------------------------
+    # Cross-agent peer loading
+    # ------------------------------------------------------------------
+
+    def _load_cross_agent_peers(self) -> None:
+        """Load cross-agent peer config from ~/.hermes/config.yaml.
+
+        Reads the top-level `cross_agent` section:
+            cross_agent:
+              enabled: true
+              peers:
+                - name: "游戏达人"
+                  url: "http://192.168.1.113:8643"
+                  key: "cross-agent-key-2026"
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml
+            config_path = get_hermes_home() / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                cross_cfg = cfg.get("cross_agent", {})
+                if isinstance(cross_cfg, dict) and cross_cfg.get("enabled"):
+                    peers = cross_cfg.get("peers", [])
+                    if isinstance(peers, list):
+                        for peer in peers:
+                            if isinstance(peer, dict) and peer.get("name") and peer.get("url"):
+                                self._cross_agent_peers.append({
+                                    "name": str(peer["name"]),
+                                    "url": str(peer["url"]).rstrip("/"),
+                                    "key": str(peer.get("key", "")),
+                                })
+                        if self._cross_agent_peers:
+                            logger.info(
+                                "[APIServer] Loaded %d cross-agent peer(s): %s",
+                                len(self._cross_agent_peers),
+                                [p["name"] for p in self._cross_agent_peers],
+                            )
+        except Exception as e:
+            logger.warning("[APIServer] Failed to load cross-agent peers: %s", e)
+
+    def _init_mention_router(self) -> None:
+        """Initialize MentionRouter from config.yaml multi_agent section."""
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml
+            config_path = get_hermes_home() / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                platforms = cfg.get("platforms", {})
+                wecom = platforms.get("wecom", {})
+                extra = wecom.get("extra", {})
+                multi_agent = extra.get("multi_agent", {})
+                if isinstance(multi_agent, dict) and multi_agent.get("enabled"):
+                    self._mention_router = MentionRouter(multi_agent)
+                    logger.info("[APIServer] MentionRouter initialized with %d agents", len(self._mention_router.agents))
+        except Exception as e:
+            logger.warning("[APIServer] Failed to init mention router: %s", e)
+
+    def _find_peer_for_agent_name(self, agent_name: str) -> Optional[Dict[str, str]]:
+        """Find the peer URL that handles the given agent name."""
+        for peer in self._cross_agent_peers:
+            if peer["name"] == agent_name:
+                return peer
+        return None
+
+    def _get_available_agent_names(self) -> List[str]:
+        """Get all available agent names from mention router and cross_agent peers."""
+        names = set()
+        # From mention router
+        if self._mention_router and self._mention_router.enabled:
+            for agent in self._mention_router.agents.values():
+                names.add(agent.name)
+        # From cross_agent peers
+        for peer in self._cross_agent_peers:
+            names.add(peer["name"])
+        return sorted(names) if names else ["其他专家"]
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -564,6 +657,259 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
+
+    async def _handle_cross_agent(self, request: "web.Request") -> "web.Response":
+        """POST /api/cross-agent — receive cross-bot trigger from another Hermes instance.
+
+        Body (JSON):
+            message: str        — the user message to process
+            chat_id: str        — WeCom group chat ID to respond to
+            user_id: str        — original sender ID
+            agent_name: str     — (optional) which agent role to respond as
+            source_bot: str     — (optional) which bot triggered this
+            chain_depth: int    — (optional) current chain depth for backward compat
+
+        The agent runs locally and returns the response text. The response
+        is also sent directly to the WeCom group via the local WeCom adapter
+        (so the triggering bot doesn't need to relay it).
+
+        Uses GroupSessionStore for chain-depth control and duplicate-agent prevention.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        message = body.get("message", "")
+        chat_id = body.get("chat_id", "")
+        user_id = body.get("user_id", "")
+        agent_name = body.get("agent_name", "")
+        source_bot = body.get("source_bot", "")
+        legacy_chain_depth = body.get("chain_depth", 0)
+
+        if not message:
+            return web.json_response(
+                {"error": {"message": "Missing 'message' field", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        logger.info(
+            "[Cross-Agent] Triggered by '%s' for agent '%s' — chat_id=%s, message=%r",
+            source_bot, agent_name, chat_id, message[:120],
+        )
+
+        # --- GroupSessionStore integration ---
+        store = get_group_session_store()
+        chain = await store.get_or_create_chain(
+            chat_id=chat_id,
+            user_message=message,
+            sender_id=user_id or "",
+            max_chain_length=5,
+            cooldown_seconds=3,
+        )
+
+        # Derive agent_id from agent_name for chain tracking
+        agent_id = agent_name.lower().replace(" ", "_").replace("-", "_")
+
+        # Chain-depth & duplicate check
+        if not chain.can_trigger_next(agent_id):
+            logger.info(
+                "[Cross-Agent GroupSession] Skipping '%s' — chain depth=%d/%d or already triggered=%s",
+                agent_name, chain.chain_depth, chain.max_chain_length, chain.triggered_agents,
+            )
+            return web.json_response({
+                "success": False,
+                "reason": "chain_limit_reached",
+                "chain_depth": chain.chain_depth,
+                "max_chain_length": chain.max_chain_length,
+            })
+
+        # Build conversation with agent identity context
+        conversation = []
+        if agent_name:
+            # Derive agent_id from agent_name for chain tracking
+            _agent_id = agent_name.lower().replace(" ", "_").replace("-", "_")
+            _available = self._get_available_agent_names()
+
+            conversation.append({
+                "role": "system",
+                "content": (
+                    f"你是 {agent_name}，正在参与一个群聊讨论。\n"
+                    f"请用专业角度回复，并在回复末尾用 @角色名 的方式邀请至少1个其他相关角色发言。\n"
+                    f"可用角色包括：{', '.join(_available) if _available else '其他专家'}。\n"
+                    f"回复要简洁，不要重复他人观点。"
+                ),
+            })
+
+        try:
+            result, usage = await self._run_agent(
+                user_message=message,
+                conversation_history=conversation,
+                session_id=f"cross-agent:{chat_id}:{uuid.uuid4().hex[:8]}",
+            )
+
+            response_text = ""
+            if isinstance(result, dict):
+                response_text = result.get("final_response", "") or result.get("content", "")
+            elif isinstance(result, str):
+                response_text = result
+
+            if not response_text:
+                response_text = "(No response generated)"
+
+            logger.info("[Cross-Agent] Response generated (%d chars)", len(response_text))
+
+            # Record this turn in the chain
+            import time
+            chain.add_turn(AgentTurnRecord(
+                agent_id=agent_id,
+                agent_name=agent_name,
+                request_text=message[:500],
+                response_text=response_text,
+                mentions_in_response=[],
+                started_at=time.time(),
+                completed_at=time.time(),
+            ))
+
+            # Directly send to WeCom group chat using local WeCom adapter
+            if chat_id:
+                try:
+                    from gateway.run import get_gateway_runner
+                    from gateway.config import Platform
+                    runner = get_gateway_runner()
+                    if runner:
+                        wecom = runner.adapters.get(Platform.WECOM)
+                        if wecom:
+                            # Add agent name prefix for visibility
+                            display_text = response_text
+                            if agent_name:
+                                display_text = f"**{agent_name}**\n\n{response_text}"
+                            await wecom.send(chat_id=chat_id, content=display_text, reply_to=None)
+                            logger.info("[Cross-Agent] Sent response via WeCom to group %s", chat_id)
+                except Exception as wecom_err:
+                    logger.error("[Cross-Agent] Failed to send via WeCom: %s", wecom_err)
+
+            # --- Cross-agent chain reaction via GroupSessionStore ---
+            # Check if response mentions other agents, using MentionRouter for proper parsing
+            if self._mention_router and self._mention_router.enabled:
+                mentioned_ids = self._mention_router.extract_mentions_from_response(response_text)
+                if mentioned_ids:
+                    logger.info("[Cross-Agent] Detected mentions in response: %s", mentioned_ids)
+                    for mentioned_agent_id in mentioned_ids:
+                        mentioned_cfg = self._mention_router.get_agent_config(mentioned_agent_id)
+                        if mentioned_cfg is None:
+                            continue
+                        mentioned_name = mentioned_cfg.name
+
+                        # Check chain limits
+                        if not chain.can_trigger_next(mentioned_agent_id):
+                            logger.info(
+                                "[Cross-Agent GroupSession] Skipping chain reaction to '%s' — limit reached",
+                                mentioned_name,
+                            )
+                            continue
+
+                        # Find peer for this agent
+                        target_peer = self._find_peer_for_agent_name(mentioned_name)
+                        if target_peer is None:
+                            # No peer — might be a local agent, skip
+                            logger.debug("[Cross-Agent] No peer found for '%s', skipping", mentioned_name)
+                            continue
+
+                        # Build context from the chain
+                        next_message = chain.build_context_for_agent(
+                            requesting_agent_name=mentioned_name,
+                            agent_role=mentioned_name,
+                            available_agents=self._get_available_agent_names(),
+                        )
+
+                        target_url = f"{target_peer['url']}/api/cross-agent"
+                        peer_key = target_peer.get("key", "cross-agent-key-2026")
+                        logger.info("[Cross-Agent] Forwarding to '%s' at %s (chain_depth=%d)",
+                                    mentioned_name, target_url, chain.chain_depth)
+
+                        payload = {
+                            "message": next_message,
+                            "chat_id": chat_id,
+                            "user_id": user_id,
+                            "agent_name": mentioned_name,
+                            "source_bot": f"bot-from-{agent_name}",
+                            "chain_depth": chain.chain_depth,
+                        }
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.post(
+                                    target_url,
+                                    json=payload,
+                                    headers={"Authorization": f"Bearer {peer_key}"}
+                                ) as resp:
+                                    if resp.status == 200:
+                                        logger.info("[Cross-Agent] Successfully triggered '%s'", mentioned_name)
+                                        # Add delay to prevent WeCom message merging
+                                        import asyncio
+                                        await asyncio.sleep(1.5)
+                                    else:
+                                        logger.warning("[Cross-Agent] Failed to trigger '%s': %d", mentioned_name, resp.status)
+                        except Exception as fwd_err:
+                            logger.error("[Cross-Agent] Forwarding error for '%s': %s", mentioned_name, fwd_err)
+            else:
+                # Fallback: raw regex mention detection (backward compat)
+                mentioned_names = re.findall(r'@([\u4e00-\u9fa5a-zA-Z0-9]+)', response_text)
+                if mentioned_names:
+                    logger.info("[Cross-Agent] Fallback mention detection: %s", mentioned_names)
+                    for name in mentioned_names:
+                        if not chain.can_trigger_next(name.lower().replace(" ", "_")):
+                            continue
+                        target_peer = self._find_peer_for_agent_name(name)
+                        if target_peer is None:
+                            continue
+                        target_url = f"{target_peer['url']}/api/cross-agent"
+                        peer_key = target_peer.get("key", "cross-agent-key-2026")
+                        next_message = chain.build_context_for_agent(
+                            requesting_agent_name=name,
+                            agent_role=name,
+                            available_agents=self._get_available_agent_names(),
+                        )
+                        payload = {
+                            "message": next_message,
+                            "chat_id": chat_id,
+                            "user_id": user_id,
+                            "agent_name": name,
+                            "source_bot": f"bot-from-{agent_name}",
+                            "chain_depth": chain.chain_depth,
+                        }
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.post(
+                                    target_url,
+                                    json=payload,
+                                    headers={"Authorization": f"Bearer {peer_key}"}
+                                ) as resp:
+                                    if resp.status == 200:
+                                        logger.info("[Cross-Agent] Successfully triggered '%s'", name)
+                        except Exception as fwd_err:
+                            logger.error("[Cross-Agent] Forwarding error for '%s': %s", name, fwd_err)
+
+            return web.json_response({
+                "success": True,
+                "response": response_text,
+                "agent_name": agent_name,
+                "usage": usage,
+            })
+
+        except Exception as e:
+            logger.error("[Cross-Agent] Agent run failed: %s", e, exc_info=True)
+            return web.json_response(
+                {"error": {"message": f"Agent run failed: {e}", "type": "server_error"}},
+                status=500,
+            )
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -1789,6 +2135,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Cross-agent triggering (bot-to-bot via HTTP)
+            self._app.router.add_post("/api/cross-agent", self._handle_cross_agent)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

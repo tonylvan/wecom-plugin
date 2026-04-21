@@ -438,6 +438,10 @@ class WeComAdapter(BasePlatformAdapter):
                     agent_name, resp.status_code, resp.text[:200],
                 )
 
+        # Add delay after peer call to prevent WeCom message merging
+        import asyncio
+        await asyncio.sleep(1.5)
+
     # ------------------------------------------------------------------
     # Overridden: _send_with_retry — hook cross-agent triggering
     # ------------------------------------------------------------------
