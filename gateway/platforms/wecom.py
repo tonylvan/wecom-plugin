@@ -59,6 +59,8 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.mention_router import MentionRouter
+from gateway.platforms.group_session import get_group_session_store
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -165,6 +167,18 @@ class WeComAdapter(BasePlatformAdapter):
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
 
+        # Mention requirement in group chats
+        rm = extra.get("require_mention")
+        env_rm = os.getenv("WECOM_REQUIRE_MENTION")
+        if rm is not None:
+            self._require_mention = str(rm).strip().lower() not in ("false", "0", "no")
+        elif env_rm is not None:
+            self._require_mention = str(env_rm).strip().lower() not in ("false", "0", "no")
+        else:
+            self._require_mention = True
+        logger.info("[%s] require_mention: rm=%r, env=%r, _require_mention=%s, extra=%s",
+                     "Wecom", rm, env_rm, self._require_mention, extra)
+
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
@@ -176,10 +190,346 @@ class WeComAdapter(BasePlatformAdapter):
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
-        self._text_batch_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
-        self._text_batch_split_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
+        # Group chats use shorter delays for faster response times.
+        self._text_batch_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.2"))
+        self._text_batch_split_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "0.8"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+        # Initialize MentionRouter for multi-agent @mention handling
+        self._mention_router = MentionRouter.from_wecom_extra(extra)
+
+        # Identify which agent this bot instance represents (for multi-agent setups)
+        # When a message @mentions a different agent, this bot should not respond.
+        self._self_agent_id: Optional[str] = str(extra.get("agent_id") or "").strip() or None
+        if self._self_agent_id and self._mention_router.enabled:
+            agent_cfg = self._mention_router.get_agent_config(self._self_agent_id)
+            agent_label = agent_cfg.name if agent_cfg else self._self_agent_id
+            logger.info("[WeCom] This instance represents agent '%s' (%s)", self._self_agent_id, agent_label)
+
+        # Cross-agent peers — other Hermes bot instances reachable via HTTP
+        self._cross_agent_peers: List[Dict[str, str]] = []
+        self._cross_agent_key: str = extra.get("cross_agent_key", os.getenv("CROSS_AGENT_KEY", "")).strip()
+        self._load_cross_agent_peers()
+
+        # Track current event context for cross-agent triggering after send
+        self._last_event: Optional[Any] = None
+
+    def _load_cross_agent_peers(self) -> None:
+        """Load cross-agent peer config from ~/.hermes/config.yaml.
+
+        Reads the top-level `cross_agent` section:
+            cross_agent:
+              enabled: true
+              peers:
+                - name: "游戏专家"
+                  url: "http://192.168.1.113:8643"
+                  key: "cross-agent-key-2026"
+
+        Also builds a quick lookup: agent_name -> peer config.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml
+            config_path = get_hermes_home() / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                cross_cfg = cfg.get("cross_agent", {})
+                if isinstance(cross_cfg, dict) and cross_cfg.get("enabled"):
+                    peers = cross_cfg.get("peers", [])
+                    if isinstance(peers, list):
+                        for peer in peers:
+                            if isinstance(peer, dict) and peer.get("name") and peer.get("url"):
+                                self._cross_agent_peers.append({
+                                    "name": str(peer["name"]),
+                                    "url": str(peer["url"]).rstrip("/"),
+                                    "key": str(peer.get("key", self._cross_agent_key)),
+                                })
+                        if self._cross_agent_peers:
+                            logger.info(
+                                "[WeCom] Loaded %d cross-agent peer(s): %s",
+                                len(self._cross_agent_peers),
+                                [p["name"] for p in self._cross_agent_peers],
+                            )
+        except Exception as e:
+            logger.warning("[WeCom] Failed to load cross-agent peers: %s", e)
+
+    def _get_available_agent_names(self) -> list:
+        """Get all available agent names from mention router and cross_agent peers."""
+        names = set()
+        # From mention router
+        if self._mention_router and self._mention_router.enabled:
+            for agent in self._mention_router.agents.values():
+                names.add(agent.name)
+        # From cross_agent peers
+        for peer in self._cross_agent_peers:
+            names.add(peer["name"])
+        return sorted(names) if names else ["其他专家"]
+
+    # ------------------------------------------------------------------
+    # Cross-agent peer triggering
+    # ------------------------------------------------------------------
+
+    async def _trigger_cross_agent_peers(
+        self,
+        response_text: str,
+        chat_id: str,
+        user_message: str = "",
+        user_id: str = "",
+    ) -> None:
+        """Scan response text for @mentions of agents on peer instances.
+
+        For each mentioned agent that lives on a peer bot (not local),
+        POST to that peer's /api/cross-agent endpoint to trigger it.
+        Uses GroupSessionStore for chain-depth and duplicate-agent control.
+        """
+        if not response_text or not self._cross_agent_peers:
+            return
+
+        router = self._mention_router
+        if not router.enabled:
+            return
+
+        # Get the current chain for this chat to enforce depth limits
+        store = get_group_session_store()
+        chain = await store.get_chain(chat_id)
+        if chain is None:
+            # No chain yet — this is a direct agent response, not a relay
+            logger.debug("[WeCom GroupSession] No active chain for %s, skipping cross-agent", chat_id)
+            return
+
+        # Find @mentions in the response
+        mentioned = router.extract_mentions_from_response(response_text)
+        if not mentioned:
+            return
+
+        # Build set of LOCAL agent names (agents handled by this instance)
+        local_agent_names = set()
+        for agent in router.agents.values():
+            local_agent_names.add(agent.name)
+
+        for agent_id in mentioned:
+            agent_cfg = router.get_agent_config(agent_id)
+            if agent_cfg is None:
+                continue
+
+            agent_name = agent_cfg.name
+
+            # Skip if this agent is local (handled by this instance)
+            if agent_name in local_agent_names:
+                continue
+
+            # GroupSessionStore chain-depth & duplicate check
+            if not chain.can_trigger_next(agent_id):
+                logger.info(
+                    "[WeCom GroupSession] Skipping response mention '%s' — chain limit or already triggered",
+                    agent_name,
+                )
+                continue
+
+            # Find the peer that handles this agent
+            target_peer = None
+            for peer in self._cross_agent_peers:
+                if peer["name"] == agent_name:
+                    target_peer = peer
+                    break
+
+            if not target_peer:
+                continue
+
+            logger.info(
+                "[WeCom Cross-Agent] Response mentions '%s' → triggering peer at %s (chain_depth=%d)",
+                agent_name, target_peer["url"], chain.chain_depth,
+            )
+
+            # Use GroupSessionStore for rich context
+            context = chain.build_context_for_agent(
+                requesting_agent_name=agent_name,
+                agent_role=agent_name,
+                available_agents=self._get_available_agent_names(),
+            )
+
+            try:
+                await self._call_peer_api(
+                    peer_url=target_peer["url"],
+                    peer_key=target_peer["key"],
+                    message=context,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    agent_name=agent_name,
+                    chain_depth=chain.chain_depth,
+                )
+                # Record the turn
+                from gateway.platforms.group_session import AgentTurnRecord
+                import time
+                chain.add_turn(AgentTurnRecord(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    request_text=response_text[:500],
+                    response_text="(peer response pending)",
+                    mentions_in_response=[],
+                    started_at=time.time(),
+                    completed_at=time.time(),
+                ))
+            except Exception as e:
+                logger.error(
+                    "[WeCom Cross-Agent] Failed to trigger peer '%s' at %s: %s",
+                    agent_name, target_peer["url"], e,
+                )
+
+    async def _call_peer_api(
+        self,
+        peer_url: str,
+        peer_key: str,
+        message: str,
+        chat_id: str,
+        user_id: str,
+        agent_name: str,
+        chain_depth: int = 0,
+    ) -> None:
+        """POST to a peer's /api/cross-agent endpoint.
+
+        The peer runs its agent and returns the response text. We then
+        send that response to the WeCom group chat, prefixed with the
+        agent name so users know who is responding.
+        """
+        if not HTTPX_AVAILABLE:
+            logger.error("[WeCom Cross-Agent] httpx not available")
+            return
+
+        payload = {
+            "message": message,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "agent_name": agent_name,
+            "source_bot": f"bot-{self._bot_id[:8]}",
+            "chain_depth": chain_depth,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {peer_key}",
+            "Content-Type": "application/json",
+        }
+
+        url = f"{peer_url}/api/cross-agent"
+        logger.info("[WeCom Cross-Agent] POST %s (agent=%s)", url, agent_name)
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code == 200:
+                try:
+                    result = resp.json()
+                    response_text = result.get("response", "")
+                    logger.info(
+                        "[WeCom Cross-Agent] Peer '%s' handled request successfully.",
+                        agent_name,
+                    )
+                    # Note: The peer is expected to send the response directly to the WeCom group
+                    # via its own WeCom connection. We do NOT forward it here.
+                except Exception as json_err:
+                    logger.error(
+                        "[WeCom Cross-Agent] Peer '%s' returned invalid response: %s",
+                        agent_name, json_err,
+                    )
+            else:
+                logger.error(
+                    "[WeCom Cross-Agent] Peer '%s' returned %d: %s",
+                    agent_name, resp.status_code, resp.text[:200],
+                )
+
+    # ------------------------------------------------------------------
+    # Overridden: _send_with_retry — hook cross-agent triggering
+    # ------------------------------------------------------------------
+
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+    ) -> "SendResult":
+        """Override to trigger cross-agent peer calls after successful send."""
+        result = await super()._send_with_retry(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+            max_retries=max_retries,
+            base_delay=base_delay,
+        )
+
+        # After successful delivery, scan response for cross-agent mentions
+        if result.success and content:
+            event = self._last_event
+            user_message = ""
+            user_id = ""
+            if event is not None:
+                user_message = event.text or ""
+                user_id = event.source.user_id or ""
+
+            try:
+                # Also trigger cross-agent peers based on original message mentions
+                # This handles cases where the user says "@A tell @B to do X"
+                # and @B is on a peer instance.
+                if hasattr(self, '_last_target_agents') and self._last_target_agents:
+                    # Build set of peer agent names (agents that live on other instances)
+                    peer_agent_names = {p["name"] for p in self._cross_agent_peers}
+                    
+                    for agent_id in self._last_target_agents:
+                        agent_cfg = self._mention_router.get_agent_config(agent_id)
+                        if agent_cfg is None:
+                            continue
+                        agent_name = agent_cfg.name
+                        
+                        # Check if this agent has a peer (lives on another instance)
+                        target_peer = None
+                        for peer in self._cross_agent_peers:
+                            if peer["name"] == agent_name:
+                                target_peer = peer
+                                break
+                        
+                        if not target_peer:
+                            continue  # This is a purely local agent
+                        
+                        logger.info(
+                            "[WeCom Cross-Agent] Original message mentions '%s' → triggering peer at %s",
+                            agent_name, target_peer["url"],
+                        )
+                        context = (
+                            f"这是一个跨 bot 协作请求。用户原始消息：{user_message}\\n\\n"
+                            f"请作为 {agent_name} 参与讨论并回复。"
+                        )
+                        try:
+                            await self._call_peer_api(
+                                peer_url=target_peer["url"],
+                                peer_key=target_peer["key"],
+                                message=context,
+                                chat_id=chat_id,
+                                user_id=user_id,
+                                agent_name=agent_name,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "[WeCom Cross-Agent] Failed to trigger peer '%s': %s",
+                                agent_name, e,
+                            )
+                
+                await self._trigger_cross_agent_peers(
+                    response_text=content,
+                    chat_id=chat_id,
+                    user_message=user_message,
+                    user_id=user_id,
+                )
+            except Exception as e:
+                logger.error("[WeCom] Cross-agent trigger failed: %s", e)
+
+            # Clear event reference to avoid stale context on next message
+            self._last_event = None
+
+        return result
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -468,6 +818,17 @@ class WeComAdapter(BasePlatformAdapter):
     # Inbound message parsing
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_bot_mentioned(body: Dict[str, Any], bot_id: str) -> bool:
+        """Check if the bot is mentioned via WeCom's mentioned_userid_list field."""
+        mentioned_list = body.get("mentioned_userid_list")
+        if isinstance(mentioned_list, list):
+            for item in mentioned_list:
+                uid = item.get("userid", "") if isinstance(item, dict) else ""
+                if uid == bot_id:
+                    return True
+        return False
+
     async def _on_message(self, payload: Dict[str, Any]) -> None:
         """Process an inbound WeCom message callback event."""
         body = payload.get("body")
@@ -488,11 +849,171 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         is_group = str(body.get("chattype") or "").lower() == "group"
+
+        # 群聊权限检查
         if is_group:
             if not self._is_group_allowed(chat_id, sender_id):
                 logger.debug("[%s] Group %s / sender %s blocked by policy", self.name, chat_id, sender_id)
                 return
-        elif not self._is_dm_allowed(sender_id):
+
+        # 检查是否被 @ (仅当 require_mention 开启时)
+        target_agents: List[str] = []
+        if is_group and self._require_mention:
+            # 首先检查是否通过 mentioned_userid_list 被 @
+            is_mentioned = self._is_bot_mentioned(body, self._bot_id)
+            logger.info("[%s] Group msg: chatid=%s, require_mention=True, is_mentioned=%s",
+                         self.name, chat_id, is_mentioned)
+            
+            # 如果没有被 @，检查是否通过文本 @mention 匹配（多 Agent 模式）
+            if not is_mentioned:
+                # WeCom AI Bot puts the text into 'text' field, which can be a JSON string
+                # representing the message structure, e.g. "{'content': '...'}" or "mixed" data.
+                raw_text = body.get("text") or body.get("content")
+                content = str(raw_text or "").strip()
+                
+                # If content looks like a dict/JSON string, parse it to get the real text
+                if content.startswith("{'") or content.startswith('{"'):
+                    try:
+                        import ast
+                        # Handle single-quoted dict strings safely
+                        data = ast.literal_eval(content)
+                        if isinstance(data, dict):
+                            # Extract text components if it's a mixed message structure
+                            if "content" in data:
+                                content = str(data["content"]).strip()
+                            elif "text" in data:
+                                content = str(data["text"]).strip()
+                            else:
+                                # Fallback: join all string values
+                                content = " ".join(str(v) for v in data.values() if isinstance(v, str)).strip()
+                    except (ValueError, SyntaxError):
+                        pass  # If parsing fails, use raw string
+
+                logger.info("[%s] Checking mention router on content: %r", self.name, content[:150])
+                
+                if not content:
+                    # If we still can't find text, log the body structure to debug
+                    logger.warning("[%s] Empty content in group msg, body keys: %s", 
+                                   self.name, list(body.keys())[:20])
+                
+                target_agents = self._mention_router.resolve_target_agents(content)
+                if not target_agents:
+                    # Fall back to default_agent when no @mention is found
+                    default = self._mention_router.default_agent_id
+                    if default and default in self._mention_router.agents:
+                        target_agents = [default]
+                        logger.info(
+                            "[%s] No @mention found, routing to default_agent '%s'",
+                            self.name, default,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] Bot not mentioned in group chat %s and no default_agent. "
+                            "bot_id=%s, content=%r",
+                            self.name, chat_id, self._bot_id, content[:100]
+                        )
+                        return
+                logger.info("[%s] Matched agents via mention_router: %s", self.name, target_agents)
+
+                # Host agent mode — host always receives all group messages
+                host_id = self._mention_router.host_agent_id
+                if (host_id
+                        and self._mention_router.host_always_active
+                        and host_id in self._mention_router.agents
+                        and host_id not in target_agents):
+                    target_agents.append(host_id)
+                    logger.info(
+                        "[%s] Host agent '%s' added to target_agents (always active mode)",
+                        self.name, host_id,
+                    )
+                
+                # Get or create the group discussion chain for chain-depth control
+                store = get_group_session_store()
+                ma_cfg = self._mention_router
+                chain = await store.get_or_create_chain(
+                    chat_id=chat_id,
+                    user_message=content,
+                    sender_id=sender_id or "",
+                    max_chain_length=ma_cfg.max_chain_length,
+                    cooldown_seconds=ma_cfg.chain_cooldown_seconds,
+                )
+                logger.info(
+                    "[WeCom GroupSession] Chain for %s: depth=%d, max=%d, triggered=%s",
+                    chat_id, chain.chain_depth, chain.max_chain_length, chain.triggered_agents,
+                )
+
+                # Check which mentioned agents should be forwarded to peer instances
+                # An agent should be forwarded if there's a cross_agent peer matching its name
+                for agent_id in target_agents:
+                    agent_cfg = self._mention_router.get_agent_config(agent_id)
+                    if agent_cfg is None:
+                        continue
+                    agent_name = agent_cfg.name
+
+                    # GroupSessionStore chain-depth & duplicate check
+                    # Host agent bypasses these checks — always receives all messages
+                    is_host = (agent_id == self._mention_router.host_agent_id
+                               and self._mention_router.host_always_active)
+                    if not chain.can_trigger_next(agent_id, is_host_agent=is_host):
+                        logger.info(
+                            "[WeCom GroupSession] Skipping '%s' — chain limit or already triggered",
+                            agent_name,
+                        )
+                        continue
+
+                    # Find if this agent lives on a peer instance
+                    target_peer = None
+                    for peer in self._cross_agent_peers:
+                        if peer["name"] == agent_name:
+                            target_peer = peer
+                            break
+
+                    if not target_peer:
+                        continue  # Agent has no peer — it's purely local
+
+                    logger.info(
+                        "[WeCom Cross-Agent] Pre-forwarding '%s' to peer at %s",
+                        agent_name, target_peer["url"],
+                    )
+                    # Use GroupSessionStore for rich context
+                    context = chain.build_context_for_agent(
+                        requesting_agent_name=agent_name,
+                        agent_role=agent_name,
+                        available_agents=self._get_available_agent_names(),
+                    )
+                    try:
+                        await self._call_peer_api(
+                            peer_url=target_peer["url"],
+                            peer_key=target_peer["key"],
+                            message=context,
+                            chat_id=chat_id,
+                            user_id=sender_id or "",
+                            agent_name=agent_name,
+                            chain_depth=chain.chain_depth,
+                        )
+                        # Record the turn immediately so we don't double-trigger
+                        from gateway.platforms.group_session import AgentTurnRecord
+                        import time
+                        chain.add_turn(AgentTurnRecord(
+                            agent_id=agent_id,
+                            agent_name=agent_name,
+                            request_text=content,
+                            response_text="(peer response pending)",
+                            mentions_in_response=[],
+                            started_at=time.time(),
+                            completed_at=time.time(),
+                        ))
+                    except Exception as e:
+                        logger.error(
+                            "[WeCom Cross-Agent] Failed to forward to peer '%s': %s",
+                            agent_name, e,
+                        )
+            else:
+                logger.debug("[%s] Bot was @mentioned in group chat %s", self.name, chat_id)
+        elif is_group:
+            logger.info("[%s] Group msg: chatid=%s, require_mention=False (accepting all)",
+                         self.name, chat_id)
+        elif not is_group and not self._is_dm_allowed(sender_id):
             logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
             return
 
@@ -506,6 +1027,24 @@ class WeComAdapter(BasePlatformAdapter):
 
         if not text and not media_urls:
             logger.debug("[%s] Empty WeCom message skipped", self.name)
+            return
+
+        # When the message explicitly @mentions specific agents via text
+        # mention routing, and the current bot was NOT natively @mentioned,
+        # this bot should only respond if it is the target agent.
+        if (is_group
+                and self._mention_router.enabled
+                and target_agents
+                and not is_mentioned
+                and self._self_agent_id
+                and self._self_agent_id not in target_agents):
+            # This message is for a different agent — skip local handling
+            self_agent_cfg = self._mention_router.get_agent_config(self._self_agent_id)
+            self_label = self_agent_cfg.name if self_agent_cfg else self._self_agent_id
+            logger.info(
+                "[%s] Message targets %s via mention routing, but this instance is '%s' — skipping local handling",
+                self.name, target_agents, self_label,
+            )
             return
 
         source = self.build_source(
@@ -533,6 +1072,14 @@ class WeComAdapter(BasePlatformAdapter):
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
+            self._last_event = event  # Track for cross-agent triggering
+
+            # Store matched target agents for post-response cross-agent forwarding
+            if is_group and self._mention_router.enabled and not is_mentioned:
+                self._last_target_agents = target_agents
+            else:
+                self._last_target_agents = []
+
             await self.handle_message(event)
 
     # ------------------------------------------------------------------
