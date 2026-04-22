@@ -693,6 +693,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_name = body.get("agent_name", "")
         source_bot = body.get("source_bot", "")
         legacy_chain_depth = body.get("chain_depth", 0)
+        collect_only = body.get("collect_only", False)
 
         if not message:
             return web.json_response(
@@ -779,7 +780,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
 
             # Directly send to WeCom group chat using local WeCom adapter
-            if chat_id:
+            # When collect_only=True, skip sending — the caller will handle delivery
+            if chat_id and not collect_only:
                 try:
                     from gateway.run import get_gateway_runner
                     from gateway.config import Platform
@@ -842,6 +844,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             "agent_name": mentioned_name,
                             "source_bot": f"bot-from-{agent_name}",
                             "chain_depth": chain.chain_depth,
+                            "collect_only": True,
                         }
                         try:
                             async with aiohttp.ClientSession() as session:
@@ -851,10 +854,24 @@ class APIServerAdapter(BasePlatformAdapter):
                                     headers={"Authorization": f"Bearer {peer_key}"}
                                 ) as resp:
                                     if resp.status == 200:
+                                        result = await resp.json()
+                                        chain_resp = result.get("response", "")
+                                        if chain_resp:
+                                            # Send with delay to prevent WeCom merging
+                                            try:
+                                                from gateway.run import get_gateway_runner
+                                                from gateway.config import Platform
+                                                runner = get_gateway_runner()
+                                                if runner:
+                                                    wecom = runner.adapters.get(Platform.WECOM)
+                                                    if wecom:
+                                                        display = f"**{mentioned_name}**\n\n{chain_resp}"
+                                                        await wecom.send(chat_id=chat_id, content=display, reply_to=None)
+                                                        import asyncio
+                                                        await asyncio.sleep(2.0)
+                                            except Exception as send_err:
+                                                logger.error("[Cross-Agent] Failed to send chain response: %s", send_err)
                                         logger.info("[Cross-Agent] Successfully triggered '%s'", mentioned_name)
-                                        # Add delay to prevent WeCom message merging
-                                        import asyncio
-                                        await asyncio.sleep(1.5)
                                     else:
                                         logger.warning("[Cross-Agent] Failed to trigger '%s': %d", mentioned_name, resp.status)
                         except Exception as fwd_err:
@@ -884,6 +901,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             "agent_name": name,
                             "source_bot": f"bot-from-{agent_name}",
                             "chain_depth": chain.chain_depth,
+                            "collect_only": True,
                         }
                         try:
                             async with aiohttp.ClientSession() as session:
@@ -893,6 +911,22 @@ class APIServerAdapter(BasePlatformAdapter):
                                     headers={"Authorization": f"Bearer {peer_key}"}
                                 ) as resp:
                                     if resp.status == 200:
+                                        result = await resp.json()
+                                        chain_resp = result.get("response", "")
+                                        if chain_resp:
+                                            try:
+                                                from gateway.run import get_gateway_runner
+                                                from gateway.config import Platform
+                                                runner = get_gateway_runner()
+                                                if runner:
+                                                    wecom = runner.adapters.get(Platform.WECOM)
+                                                    if wecom:
+                                                        display = f"**{name}**\n\n{chain_resp}"
+                                                        await wecom.send(chat_id=chat_id, content=display, reply_to=None)
+                                                        import asyncio
+                                                        await asyncio.sleep(2.0)
+                                            except Exception as send_err:
+                                                logger.error("[Cross-Agent] Failed to send chain response: %s", send_err)
                                         logger.info("[Cross-Agent] Successfully triggered '%s'", name)
                         except Exception as fwd_err:
                             logger.error("[Cross-Agent] Forwarding error for '%s': %s", name, fwd_err)

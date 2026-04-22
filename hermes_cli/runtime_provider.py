@@ -77,6 +77,9 @@ def _get_model_config() -> Dict[str, Any]:
             cfg["default"] = cfg["model"]
         default = (cfg.get("default") or "").strip()
         base_url = (cfg.get("base_url") or "").strip()
+        # Strip api_key to prevent trailing-space auth failures (#trailing-space)
+        if "api_key" in cfg and isinstance(cfg["api_key"], str):
+            cfg["api_key"] = cfg["api_key"].strip()
         is_local = "localhost" in base_url or "127.0.0.1" in base_url
         is_fallback = not default
         if is_local and is_fallback and base_url:

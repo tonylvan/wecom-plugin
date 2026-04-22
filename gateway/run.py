@@ -509,6 +509,21 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+# ── Cross-agent API: global runner reference ──────────────────────
+_gateway_runner: Optional["GatewayRunner"] = None
+
+
+def _set_gateway_runner(runner: "GatewayRunner") -> None:
+    """Store a reference to the active GatewayRunner for cross-agent API access."""
+    global _gateway_runner
+    _gateway_runner = runner
+
+
+def get_gateway_runner() -> Optional["GatewayRunner"]:
+    """Get the active GatewayRunner (for cross-agent API endpoint)."""
+    return _gateway_runner
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -3592,6 +3607,19 @@ class GatewayRunner:
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
+
+            # WeCom multi-agent dispatch handles its own response delivery.
+            # When the adapter sets _skip_delivery on the event, we still run
+            # the agent and persist the transcript, but skip sending the
+            # response back to the platform (the adapter sends it with agent
+            # name prefixes). (#multi-agent)
+            if getattr(event, "_skip_delivery", False):
+                logger.info(
+                    "[WeCom Multi-Agent] Skipping gateway-level delivery for "
+                    "session %s — adapter handles delivery",
+                    session_key[:20],
+                )
+                return None
 
             # Surface error details when the agent failed silently (final_response=None)
             if not response and agent_result.get("failed"):
@@ -7718,7 +7746,14 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _status_thread_metadata: Optional[Dict[str, Any]] = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        # In group chats, inject the user's display name for @mention support
+        if getattr(source, "chat_type", None) == "group":
+            display_name = getattr(source, "user_name", None) or getattr(source, "user_id", None)
+            if display_name:
+                if _status_thread_metadata is None:
+                    _status_thread_metadata = {}
+                _status_thread_metadata["mention_names"] = [display_name]
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -7842,7 +7877,7 @@ class GatewayRunner:
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            metadata=dict(_status_thread_metadata) if _status_thread_metadata else None,
                         )
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta
@@ -8912,6 +8947,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logging.getLogger().setLevel(_stderr_level)
 
     runner = GatewayRunner(config)
+    _set_gateway_runner(runner)  # Expose for cross-agent API endpoint
     
     # Set up signal handlers
     def shutdown_signal_handler():

@@ -351,7 +351,7 @@ class WeComAdapter(BasePlatformAdapter):
             )
 
             try:
-                await self._call_peer_api(
+                response_text = await self._call_peer_api(
                     peer_url=target_peer["url"],
                     peer_key=target_peer["key"],
                     message=context,
@@ -359,19 +359,26 @@ class WeComAdapter(BasePlatformAdapter):
                     user_id=user_id,
                     agent_name=agent_name,
                     chain_depth=chain.chain_depth,
+                    collect_only=True,
                 )
-                # Record the turn
-                from gateway.platforms.group_session import AgentTurnRecord
-                import time
-                chain.add_turn(AgentTurnRecord(
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    request_text=response_text[:500],
-                    response_text="(peer response pending)",
-                    mentions_in_response=[],
-                    started_at=time.time(),
-                    completed_at=time.time(),
-                ))
+                if response_text:
+                    # Send the response with delay to prevent WeCom merging
+                    display_text = f"**{agent_name}**\n\n{response_text}"
+                    await self.send(chat_id=chat_id, content=display_text, reply_to=None)
+                    import asyncio
+                    await asyncio.sleep(2.0)
+                    # Record the turn
+                    from gateway.platforms.group_session import AgentTurnRecord
+                    import time
+                    chain.add_turn(AgentTurnRecord(
+                        agent_id=agent_id,
+                        agent_name=agent_name,
+                        request_text=response_text[:500],
+                        response_text=response_text[:500],
+                        mentions_in_response=[],
+                        started_at=time.time(),
+                        completed_at=time.time(),
+                    ))
             except Exception as e:
                 logger.error(
                     "[WeCom Cross-Agent] Failed to trigger peer '%s' at %s: %s",
@@ -387,16 +394,16 @@ class WeComAdapter(BasePlatformAdapter):
         user_id: str,
         agent_name: str,
         chain_depth: int = 0,
-    ) -> None:
+        collect_only: bool = True,
+    ) -> Optional[str]:
         """POST to a peer's /api/cross-agent endpoint.
 
-        The peer runs its agent and returns the response text. We then
-        send that response to the WeCom group chat, prefixed with the
-        agent name so users know who is responding.
+        When collect_only=True (default), the peer returns the response text
+        without sending to WeCom. The caller then sends it with proper delays.
         """
         if not HTTPX_AVAILABLE:
             logger.error("[WeCom Cross-Agent] httpx not available")
-            return
+            return None
 
         payload = {
             "message": message,
@@ -405,6 +412,7 @@ class WeComAdapter(BasePlatformAdapter):
             "agent_name": agent_name,
             "source_bot": f"bot-{self._bot_id[:8]}",
             "chain_depth": chain_depth,
+            "collect_only": collect_only,
         }
 
         headers = {
@@ -415,18 +423,17 @@ class WeComAdapter(BasePlatformAdapter):
         url = f"{peer_url}/api/cross-agent"
         logger.info("[WeCom Cross-Agent] POST %s (agent=%s)", url, agent_name)
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code == 200:
                 try:
                     result = resp.json()
                     response_text = result.get("response", "")
                     logger.info(
-                        "[WeCom Cross-Agent] Peer '%s' handled request successfully.",
-                        agent_name,
+                        "[WeCom Cross-Agent] Peer '%s' returned response (%d chars).",
+                        agent_name, len(response_text),
                     )
-                    # Note: The peer is expected to send the response directly to the WeCom group
-                    # via its own WeCom connection. We do NOT forward it here.
+                    return response_text
                 except Exception as json_err:
                     logger.error(
                         "[WeCom Cross-Agent] Peer '%s' returned invalid response: %s",
@@ -437,10 +444,7 @@ class WeComAdapter(BasePlatformAdapter):
                     "[WeCom Cross-Agent] Peer '%s' returned %d: %s",
                     agent_name, resp.status_code, resp.text[:200],
                 )
-
-        # Add delay after peer call to prevent WeCom message merging
-        import asyncio
-        await asyncio.sleep(1.5)
+        return None
 
     # ------------------------------------------------------------------
     # Overridden: _send_with_retry — hook cross-agent triggering
@@ -479,8 +483,8 @@ class WeComAdapter(BasePlatformAdapter):
                 # This handles cases where the user says "@A tell @B to do X"
                 # and @B is on a peer instance.
                 if hasattr(self, '_last_target_agents') and self._last_target_agents:
-                    # Build set of peer agent names (agents that live on other instances)
-                    peer_agent_names = {p["name"] for p in self._cross_agent_peers}
+                    # Collect peer responses, send one by one with delays
+                    peer_responses: list = []
                     
                     for agent_id in self._last_target_agents:
                         agent_cfg = self._mention_router.get_agent_config(agent_id)
@@ -507,18 +511,34 @@ class WeComAdapter(BasePlatformAdapter):
                             f"请作为 {agent_name} 参与讨论并回复。"
                         )
                         try:
-                            await self._call_peer_api(
+                            response_text = await self._call_peer_api(
                                 peer_url=target_peer["url"],
                                 peer_key=target_peer["key"],
                                 message=context,
                                 chat_id=chat_id,
                                 user_id=user_id,
                                 agent_name=agent_name,
+                                collect_only=True,
                             )
+                            if response_text:
+                                peer_responses.append((agent_name, response_text))
                         except Exception as e:
                             logger.error(
                                 "[WeCom Cross-Agent] Failed to trigger peer '%s': %s",
                                 agent_name, e,
+                            )
+                    
+                    # Send collected peer responses with delays
+                    for agent_name, resp_text in peer_responses:
+                        display_text = f"**{agent_name}**\n\n{resp_text}"
+                        try:
+                            await self.send(chat_id=chat_id, content=display_text, reply_to=None)
+                            import asyncio
+                            await asyncio.sleep(2.0)
+                        except Exception as send_err:
+                            logger.error(
+                                "[WeCom Cross-Agent] Failed to send peer response from '%s': %s",
+                                agent_name, send_err,
                             )
                 
                 await self._trigger_cross_agent_peers(
@@ -862,6 +882,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         # 检查是否被 @ (仅当 require_mention 开启时)
         target_agents: List[str] = []
+        is_mentioned = False  # Default: not mentioned (defined for all code paths)
         if is_group and self._require_mention:
             # 首先检查是否通过 mentioned_userid_list 被 @
             is_mentioned = self._is_bot_mentioned(body, self._bot_id)
@@ -946,6 +967,10 @@ class WeComAdapter(BasePlatformAdapter):
                     chat_id, chain.chain_depth, chain.max_chain_length, chain.triggered_agents,
                 )
 
+                # Collect peer responses, then send them one by one with delays
+                # to prevent WeCom from merging the messages
+                peer_responses: list = []
+
                 # Check which mentioned agents should be forwarded to peer instances
                 # An agent should be forwarded if there's a cross_agent peer matching its name
                 for agent_id in target_agents:
@@ -986,7 +1011,7 @@ class WeComAdapter(BasePlatformAdapter):
                         available_agents=self._get_available_agent_names(),
                     )
                     try:
-                        await self._call_peer_api(
+                        response_text = await self._call_peer_api(
                             peer_url=target_peer["url"],
                             peer_key=target_peer["key"],
                             message=context,
@@ -994,24 +1019,46 @@ class WeComAdapter(BasePlatformAdapter):
                             user_id=sender_id or "",
                             agent_name=agent_name,
                             chain_depth=chain.chain_depth,
+                            collect_only=True,
                         )
-                        # Record the turn immediately so we don't double-trigger
-                        from gateway.platforms.group_session import AgentTurnRecord
-                        import time
-                        chain.add_turn(AgentTurnRecord(
-                            agent_id=agent_id,
-                            agent_name=agent_name,
-                            request_text=content,
-                            response_text="(peer response pending)",
-                            mentions_in_response=[],
-                            started_at=time.time(),
-                            completed_at=time.time(),
-                        ))
+                        if response_text:
+                            peer_responses.append((agent_name, response_text))
+                            # Record the turn
+                            from gateway.platforms.group_session import AgentTurnRecord
+                            import time
+                            chain.add_turn(AgentTurnRecord(
+                                agent_id=agent_id,
+                                agent_name=agent_name,
+                                request_text=content,
+                                response_text=response_text[:500],
+                                mentions_in_response=[],
+                                started_at=time.time(),
+                                completed_at=time.time(),
+                            ))
                     except Exception as e:
                         logger.error(
                             "[WeCom Cross-Agent] Failed to forward to peer '%s': %s",
                             agent_name, e,
                         )
+
+                # Send collected peer responses one by one with delays
+                for agent_name, resp_text in peer_responses:
+                    display_text = f"**{agent_name}**\n\n{resp_text}"
+                    try:
+                        await self.send(chat_id=chat_id, content=display_text, reply_to=None)
+                        logger.info(
+                            "[WeCom Cross-Agent] Sent peer response from '%s' to group %s",
+                            agent_name, chat_id,
+                        )
+                        # Delay to prevent WeCom message merging
+                        import asyncio
+                        await asyncio.sleep(2.0)
+                    except Exception as send_err:
+                        logger.error(
+                            "[WeCom Cross-Agent] Failed to send peer response from '%s': %s",
+                            agent_name, send_err,
+                        )
+
             else:
                 logger.debug("[%s] Bot was @mentioned in group chat %s", self.name, chat_id)
         elif is_group:
@@ -1051,6 +1098,25 @@ class WeComAdapter(BasePlatformAdapter):
             )
             return
 
+        # CRITICAL: Peer instances must NOT respond directly to WeCom in group chats.
+        # The host instance is responsible for collecting peer responses via the
+        # cross-agent API and sending them sequentially with delays to prevent
+        # WeCom from merging the messages. Peer instances should only respond
+        # when triggered via the cross-agent API (collect_only=True path).
+        # EXCEPTION: Skip is bypassed when the message is explicitly directed to
+        # this agent (via mention_router) or when the bot was natively @mentioned.
+        if (is_group
+                and self._self_agent_id
+                and self._cross_agent_peers
+                and not is_mentioned
+                and self._self_agent_id not in target_agents):
+            logger.info(
+                "[%s] Peer instance in group chat — skipping local WeCom response, "
+                "waiting for host to collect via cross-agent API",
+                self.name,
+            )
+            return
+
         source = self.build_source(
             chat_id=chat_id,
             chat_type="group" if is_group else "dm",
@@ -1073,6 +1139,11 @@ class WeComAdapter(BasePlatformAdapter):
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the WeCom client.
+        # 群聊预回复：在开始处理前，立即发送一条"收到"消息
+        # 让群聊体验更真实——先确认收到，再处理任务
+        if is_group:
+            self._send_acknowledge(chat_id, sender_id)
+
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
@@ -1972,6 +2043,33 @@ class WeComAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """WeCom does not expose typing indicators in this adapter."""
         del chat_id, metadata
+
+    async def _send_acknowledge(self, chat_id: str, sender_id: str) -> None:
+        """在群聊中收到指令后，立即发送一条'收到'消息，然后再处理。
+
+        这会创建更真实的群聊体验——先确认收到，再开始工作。
+        """
+        import random
+
+        # 随机选择一条回复，增加自然感
+        ack_messages = [
+            "收到 👍",
+            "好的，马上处理！",
+            "收到了，让我想想...",
+            "好嘞，我来看看~",
+            "收到！给我一点时间 ⏳",
+        ]
+        ack_text = random.choice(ack_messages)
+
+        # 发送后立刻处理，不阻塞主流程
+        async def _send_ack():
+            try:
+                await asyncio.sleep(random.uniform(0.3, 0.8))  # 模拟"看到消息"的延迟
+                await self.send(chat_id=chat_id, content=ack_text)
+            except Exception as e:
+                logger.debug("[WeCom] Failed to send acknowledge: %s", e)
+
+        asyncio.create_task(_send_ack())
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
