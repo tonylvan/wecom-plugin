@@ -304,11 +304,6 @@ class WeComAdapter(BasePlatformAdapter):
         if not mentioned:
             return
 
-        # Build set of LOCAL agent names (agents handled by this instance)
-        local_agent_names = set()
-        for agent in router.agents.values():
-            local_agent_names.add(agent.name)
-
         for agent_id in mentioned:
             agent_cfg = router.get_agent_config(agent_id)
             if agent_cfg is None:
@@ -316,8 +311,18 @@ class WeComAdapter(BasePlatformAdapter):
 
             agent_name = agent_cfg.name
 
-            # Skip if this agent is local (handled by this instance)
-            if agent_name in local_agent_names:
+            # Skip if this agent has no cross-agent peer configured.
+            # An agent may be listed locally (for mention parsing) but actually
+            # be served by a peer instance — we must NOT skip in that case.
+            target_peer = None
+            for peer in self._cross_agent_peers:
+                if peer["name"] == agent_name:
+                    target_peer = peer
+                    break
+
+            if not target_peer:
+                # No peer means this agent is truly handled by this instance,
+                # or there's simply no configured peer to forward to — skip.
                 continue
 
             # GroupSessionStore chain-depth & duplicate check
@@ -326,16 +331,6 @@ class WeComAdapter(BasePlatformAdapter):
                     "[WeCom GroupSession] Skipping response mention '%s' — chain limit or already triggered",
                     agent_name,
                 )
-                continue
-
-            # Find the peer that handles this agent
-            target_peer = None
-            for peer in self._cross_agent_peers:
-                if peer["name"] == agent_name:
-                    target_peer = peer
-                    break
-
-            if not target_peer:
                 continue
 
             logger.info(
@@ -762,7 +757,7 @@ class WeComAdapter(BasePlatformAdapter):
         if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
             return
 
-        logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
+        logger.info("[%s] Non-callback WS payload: cmd=%s, body_keys=%s, body=%s", self.name, cmd or "(none)", list((payload.get("body") or {}).keys())[:15], str(payload.get("body"))[:300])
 
     def _fail_pending_responses(self, exc: Exception) -> None:
         """Fail all outstanding request futures."""
@@ -858,6 +853,12 @@ class WeComAdapter(BasePlatformAdapter):
         body = payload.get("body")
         if not isinstance(body, dict):
             return
+        # DEBUG: Log all inbound message bodies for group chat troubleshooting
+        chattype = body.get("chattype", "unknown")
+        chatid = body.get("chatid", "unknown")
+        logger.info("[WeCom DEBUG] Inbound message: chattype=%s, chatid=%s, body_keys=%s, bot_id=%s, mentioned_list=%s, text=%s",
+                     chattype, chatid, list(body.keys())[:20], self._bot_id,
+                     body.get("mentioned_userid_list"), str(body.get("text", ""))[:100])
 
         msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
         if self._dedup.is_duplicate(msg_id):
