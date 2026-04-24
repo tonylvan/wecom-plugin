@@ -527,7 +527,12 @@ class WeComAdapter(BasePlatformAdapter):
             
             # 如果没有被 @，检查是否通过文本 @mention 匹配（多 Agent 模式）
             if not is_mentioned:
-                content = str(body.get("content") or "").strip()
+                # 提取文本内容（企业微信消息结构为 body["text"]["content"]）
+                text_block = body.get("text") if isinstance(body.get("text"), dict) else {}
+                content = str(text_block.get("content") or "").strip()
+                # 如果 text.content 为空，尝试 body.content（兼容旧格式）
+                if not content:
+                    content = str(body.get("content") or "").strip()
                 target_agents = self._mention_router.resolve_target_agents(content)
                 if not target_agents:
                     logger.debug(
