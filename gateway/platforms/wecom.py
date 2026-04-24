@@ -1143,7 +1143,7 @@ class WeComAdapter(BasePlatformAdapter):
         # 群聊预回复：在开始处理前，立即发送一条"收到"消息
         # 让群聊体验更真实——先确认收到，再处理任务
         if is_group:
-            self._send_acknowledge(chat_id, sender_id)
+            await self._send_acknowledge(chat_id, sender_id)
 
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
