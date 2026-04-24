@@ -980,6 +980,20 @@ class WeComAdapter(BasePlatformAdapter):
                     f"\
 [System] Your turn to respond as {agent_cfg.name}."
                 )
+            else:
+                # First turn: instruct agent to @mention other agents if discussion is requested
+                other_agents = [
+                    f"@{other_cfg.name}"
+                    for other_id, other_cfg in router.agents.items()
+                    if other_id != agent_id
+                ]
+                if other_agents:
+                    context_lines.append(
+                        f"[System] You are in a group discussion with other agents: "
+                        f"{', '.join(other_agents)}. "
+                        f"If the user asks for a discussion or you want other agents to participate, "
+                        f"please @mention them at the end of your response (e.g., '...@需求专家 @技术专家')."
+                    )
 
             # Prepend context to user message for this agent
             if context_lines:
