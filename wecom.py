@@ -1050,6 +1050,15 @@ class WeComAdapter(BasePlatformAdapter):
                 )
                 chain.add_turn(turn)
 
+                # Auto-mention other agents that haven't participated yet
+                other_agents = [
+                    f"@{other_cfg.name}"
+                    for other_id, other_cfg in router.agents.items()
+                    if other_id != agent_id and other_id not in chain.triggered_agents
+                ]
+                if other_agents:
+                    response_text = f"{response_text}\n\n{' '.join(other_agents)}"
+
                 # Send response to group chat with agent name prefix
                 send_text = f"**{agent_cfg.name}**\
 \
