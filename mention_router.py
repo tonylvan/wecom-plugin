@@ -15,9 +15,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ASCII + CJK full-width punctuation that can follow a mention
-_MENTION_BOUNDARY_RIGHT = r"[/s,.:;!?，。！？；：、)/]）】」』]"
+_MENTION_BOUNDARY_RIGHT = r"[\s,.:;!?，。！？；：、)\]）】」』]"
 # Left boundary: @ must not be preceded by word chars or dots
-_MENTION_BOUNDARY_LEFT = r"(?<!/w)"
+_MENTION_BOUNDARY_LEFT = r"(?<!\w)"
 
 
 class AgentConfig:
