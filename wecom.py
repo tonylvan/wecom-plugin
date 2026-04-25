@@ -142,19 +142,34 @@ def _entry_matches(entries: List[str], target: str) -> bool:
 def _is_bot_mentioned(body: Dict[str, Any], bot_id: str) -> bool:
     """
     Check if the bot is mentioned in a group chat message.
-    
+
     WeCom sends mentioned user IDs in the `mentioned_userid_list` field.
     """
     if not bot_id:
         return False
-    
+
     # Get mentioned user list from WeCom message
     mentioned_list = body.get("mentioned_userid_list") or []
     if not isinstance(mentioned_list, list):
         mentioned_list = [mentioned_list] if mentioned_list else []
-    
+
     # Check if bot's userid is in the mentioned list
     return bot_id in mentioned_list
+
+
+def _is_message_from_bot(body: Dict[str, Any]) -> bool:
+    """Check if the message was sent by a bot (AI Bot)."""
+    sender = body.get("from") if isinstance(body.get("from"), dict) else {}
+    # WeCom AI Bot messages have sender_type "aibot" or similar
+    sender_type = str(sender.get("type") or "").lower()
+    if sender_type in {"aibot", "bot", "ai"}:
+        return True
+    # Also check if the content starts with "**Name**" pattern (bot message format)
+    text_block = body.get("text") if isinstance(body.get("text"), dict) else {}
+    content = str(text_block.get("content") or "").strip()
+    if content.startswith("**") and "**\n\n" in content:
+        return True
+    return False
 
 
 class WeComAdapter(BasePlatformAdapter):
@@ -522,6 +537,11 @@ class WeComAdapter(BasePlatformAdapter):
 
         # 群聊中需要检查机器人是否被 @
         if is_group:
+            # 检测是否来自其他机器人的消息
+            is_from_bot = _is_message_from_bot(body)
+            if is_from_bot:
+                logger.debug("[%s] Message from bot detected in group %s", self.name, chat_id)
+
             # 首先检查是否通过 mentioned_userid_list 被 @
             is_mentioned = _is_bot_mentioned(body, self._bot_id)
 
@@ -541,6 +561,22 @@ class WeComAdapter(BasePlatformAdapter):
                         self.name, chat_id, self._bot_id, content[:100]
                     )
                     return
+                # 如果消息来自其他机器人，检查是否明确@了当前机器人
+                # 避免机器人之间因格式匹配而产生循环
+                if is_from_bot:
+                    # Find current agent's ID from router config (matching by bot_id is unreliable)
+                    current_agent_id = None
+                    for aid, cfg in self._mention_router.agents.items():
+                        if cfg.name.lower() in self.name.lower() or aid.lower() in self.name.lower():
+                            current_agent_id = aid
+                            break
+                    if current_agent_id and current_agent_id not in target_agents:
+                        logger.debug(
+                            "[%s] Ignoring bot message in group %s — not directly mentioned "
+                            "(current_agent=%s, target_agents=%s)",
+                            self.name, chat_id, current_agent_id, target_agents,
+                        )
+                        return
                 logger.debug("[%s] Matched agents via mention_router: %s", self.name, target_agents)
             else:
                 logger.debug("[%s] Bot was @mentioned in group chat %s", self.name, chat_id)
@@ -1048,18 +1084,6 @@ class WeComAdapter(BasePlatformAdapter):
             if response_text:
                 all_responses.append(response_text)
 
-                # Record this turn
-                turn = AgentTurnRecord(
-                    agent_id=agent_id,
-                    agent_name=agent_cfg.name,
-                    request_text=text,
-                    response_text=response_text,
-                    mentions_in_response=[],
-                    started_at=_time.time(),
-                    completed_at=_time.time(),
-                )
-                chain.add_turn(turn)
-
                 # Auto-mention other agents that haven't participated yet
                 other_agents = [
                     f"@{other_cfg.name}"
@@ -1068,6 +1092,21 @@ class WeComAdapter(BasePlatformAdapter):
                 ]
                 if other_agents:
                     response_text = f"{response_text}\n\n{' '.join(other_agents)}"
+
+                # Extract mentions from the final response text (with auto-mentions)
+                mentions_in_response = router.extract_mentions_from_response(response_text)
+
+                # Record this turn with the final response text
+                turn = AgentTurnRecord(
+                    agent_id=agent_id,
+                    agent_name=agent_cfg.name,
+                    request_text=text,
+                    response_text=response_text,
+                    mentions_in_response=mentions_in_response,
+                    started_at=_time.time(),
+                    completed_at=_time.time(),
+                )
+                chain.add_turn(turn)
 
                 # Send response to group chat with agent name prefix
                 await self._send_agent_response(
