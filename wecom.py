@@ -524,7 +524,7 @@ class WeComAdapter(BasePlatformAdapter):
         if is_group:
             # 首先检查是否通过 mentioned_userid_list 被 @
             is_mentioned = _is_bot_mentioned(body, self._bot_id)
-            
+
             # 如果没有被 @，检查是否通过文本 @mention 匹配（多 Agent 模式）
             if not is_mentioned:
                 # 提取文本内容（企业微信消息结构为 body["text"]["content"]）
@@ -545,10 +545,14 @@ class WeComAdapter(BasePlatformAdapter):
             else:
                 logger.debug("[%s] Bot was @mentioned in group chat %s", self.name, chat_id)
 
-        text, reply_text = self._extract_text(body)
-        media_urls, media_types = await self._extract_media(body)
-        message_type = self._derive_message_type(body, text, media_types)
-        has_reply_context = bool(reply_text and (text or media_urls))
+        try:
+            text, reply_text = self._extract_text(body)
+            media_urls, media_types = await self._extract_media(body)
+            message_type = self._derive_message_type(body, text, media_types)
+            has_reply_context = bool(reply_text and (text or media_urls))
+        except Exception as exc:
+            logger.warning("[%s] Failed to extract message content: %s", self.name, exc)
+            return
 
         if not text and reply_text and not media_urls:
             text = reply_text
@@ -654,7 +658,13 @@ class WeComAdapter(BasePlatformAdapter):
                 "[WeCom] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            await self.handle_message(event)
+            # Route to multi-agent dispatch if this is a group chat
+            is_group = event.source.chat_type == "group"
+            if is_group and self._mention_router.enabled and self._mention_router.cross_agent_enabled:
+                sender_id = event.source.user_id or ""
+                await self._dispatch_group_multi_agent(event, sender_id)
+            else:
+                await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
@@ -1060,12 +1070,10 @@ class WeComAdapter(BasePlatformAdapter):
                     response_text = f"{response_text}\n\n{' '.join(other_agents)}"
 
                 # Send response to group chat with agent name prefix
-                send_text = f"**{agent_cfg.name}**\
-\
-{response_text}"
-                await self.send(
+                await self._send_agent_response(
                     chat_id=chat_id,
-                    content=send_text,
+                    agent_name=agent_cfg.name,
+                    response_text=response_text,
                     reply_to=event.message_id,
                 )
 
@@ -1083,7 +1091,10 @@ class WeComAdapter(BasePlatformAdapter):
         chain,
     ) -> None:
         """Check the latest agent response for @mentions of other agents
-        and automatically trigger them (cross-agent chaining)."""
+        and automatically trigger them (cross-agent chaining).
+
+        Uses iterative approach instead of recursion to avoid stack issues.
+        """
         from gateway.platforms.group_session import (
             get_group_session_store,
             AgentTurnRecord,
@@ -1096,116 +1107,110 @@ class WeComAdapter(BasePlatformAdapter):
         router = self._mention_router
         store = get_group_session_store()
 
-        # Scan the last turn's response for @mentions
-        last_turn = chain.turn_records[-1]
-        mentioned_agents = router.extract_mentions_from_response(
-            last_turn.response_text
-        )
-
-        # Filter out already-triggered agents
-        already_triggered = set(chain.triggered_agents)
-        next_agents = [
-            aid for aid in mentioned_agents
-            if aid not in already_triggered
-            and router.get_agent_config(aid) is not None
-        ]
-
-        if not next_agents:
-            # No new agents to chain — mark complete
-            await store.complete_chain(chat_id)
-            await store.clear_chain(chat_id)
-            return
-
-        # Trigger each next agent in sequence
-        for agent_id in next_agents:
-            if not chain.can_trigger_next(agent_id):
-                logger.info(
-                    "[WeCom Multi-Agent] Skipping agent '%s' — chain limit or cooldown",
-                    agent_id,
-                )
-                continue
-
-            agent_cfg = router.get_agent_config(agent_id)
-            if agent_cfg is None:
-                continue
-
-            logger.info(
-                "[WeCom Multi-Agent] Cross-agent chain: '%s' -> '%s' "
-                "(depth %d/%d)",
-                last_turn.agent_id, agent_id,
-                chain.chain_depth + 1, chain.max_chain_length,
+        # Iterative chaining loop
+        while chain.chain_depth < chain.max_chain_length:
+            # Scan the last turn's response for @mentions
+            last_turn = chain.turn_records[-1]
+            mentioned_agents = router.extract_mentions_from_response(
+                last_turn.response_text
             )
 
-            # Build full conversation context
-            context = chain.get_conversation_context()
-            enriched_text = (
-                f"[System] A colleague @{agent_cfg.name} asked you to respond. "
-                f"Here is the full conversation so far:\
-\
-{context}\
-\
-"
-                f"Please respond as {agent_cfg.name}."
-            )
-
-            enriched_event = MessageEvent(
-                text=enriched_text,
-                message_type=original_event.message_type,
-                source=original_event.source,
-                raw_message=original_event.raw_message,
-                message_id=original_event.message_id,
-                media_urls=original_event.media_urls,
-                media_types=original_event.media_types,
-                reply_to_message_id=original_event.reply_to_message_id,
-                reply_to_text=original_event.reply_to_text,
-                timestamp=original_event.timestamp,
-            )
-            enriched_event._skip_delivery = True  # type: ignore[attr-defined]
-
-            response_text = await self.handle_message(enriched_event)
-            if response_text:
-                turn = AgentTurnRecord(
-                    agent_id=agent_id,
-                    agent_name=agent_cfg.name,
-                    request_text=context,
-                    response_text=response_text,
-                    mentions_in_response=[],
-                    started_at=_time.time(),
-                    completed_at=_time.time(),
-                )
-                chain.add_turn(turn)
-
-                send_text = f"**{agent_cfg.name}**\
-\
-{response_text}"
-                await self.send(
-                    chat_id=chat_id,
-                    content=send_text,
-                    reply_to=original_event.message_id,
-                )
-
-        # After chain, check if there are more agents to trigger recursively
-        if chain.turn_records:
-            latest_response = chain.turn_records[-1].response_text
-            more_mentions = router.extract_mentions_from_response(latest_response)
-            still_pending = [
-                aid for aid in more_mentions
-                if aid not in set(chain.triggered_agents)
+            # Filter out already-triggered agents
+            already_triggered = set(chain.triggered_agents)
+            next_agents = [
+                aid for aid in mentioned_agents
+                if aid not in already_triggered
                 and router.get_agent_config(aid) is not None
             ]
-            if still_pending and chain.chain_depth < chain.max_chain_length:
-                # Recurse for further chaining
-                await self._process_cross_agent_chain(
-                    chat_id=chat_id,
-                    original_event=original_event,
-                    chain=chain,
+
+            if not next_agents:
+                # No new agents to chain — mark complete
+                break
+
+            # Trigger each next agent in sequence
+            triggered_any = False
+            for agent_id in next_agents:
+                if not chain.can_trigger_next(agent_id):
+                    logger.info(
+                        "[WeCom Multi-Agent] Skipping agent '%s' — chain limit or cooldown",
+                        agent_id,
+                    )
+                    continue
+
+                agent_cfg = router.get_agent_config(agent_id)
+                if agent_cfg is None:
+                    continue
+
+                logger.info(
+                    "[WeCom Multi-Agent] Cross-agent chain: '%s' -> '%s' "
+                    "(depth %d/%d)",
+                    last_turn.agent_id, agent_id,
+                    chain.chain_depth + 1, chain.max_chain_length,
                 )
-            else:
-                await store.complete_chain(chat_id)
-                await store.clear_chain(chat_id)
-        else:
-            await store.complete_chain(chat_id)
-            await store.clear_chain(chat_id)
+
+                # Build full conversation context
+                context = chain.get_conversation_context()
+                enriched_text = (
+                    f"[System] A colleague @{agent_cfg.name} asked you to respond. "
+                    f"Here is the full conversation so far:\n\n{context}\n\n"
+                    f"Please respond as {agent_cfg.name}."
+                )
+
+                enriched_event = MessageEvent(
+                    text=enriched_text,
+                    message_type=original_event.message_type,
+                    source=original_event.source,
+                    raw_message=original_event.raw_message,
+                    message_id=original_event.message_id,
+                    media_urls=original_event.media_urls,
+                    media_types=original_event.media_types,
+                    reply_to_message_id=original_event.reply_to_message_id,
+                    reply_to_text=original_event.reply_to_text,
+                    timestamp=original_event.timestamp,
+                )
+                enriched_event._skip_delivery = True  # type: ignore[attr-defined]
+
+                response_text = await self.handle_message(enriched_event)
+                if response_text:
+                    turn = AgentTurnRecord(
+                        agent_id=agent_id,
+                        agent_name=agent_cfg.name,
+                        request_text=context,
+                        response_text=response_text,
+                        mentions_in_response=[],
+                        started_at=_time.time(),
+                        completed_at=_time.time(),
+                    )
+                    chain.add_turn(turn)
+                    triggered_any = True
+
+                    await self._send_agent_response(
+                        chat_id=chat_id,
+                        agent_name=agent_cfg.name,
+                        response_text=response_text,
+                        reply_to=original_event.message_id,
+                    )
+
+            if not triggered_any:
+                break
+
+        await store.complete_chain(chat_id)
+        await store.clear_chain(chat_id)
+
+    async def _send_agent_response(
+        self,
+        chat_id: str,
+        agent_name: str,
+        response_text: str,
+        reply_to: Optional[str] = None,
+    ) -> None:
+        """Send an agent's response to the group chat with name prefix."""
+        send_text = f"**{agent_name}**\n\n{response_text}"
+        await self.send(
+            chat_id=chat_id,
+            content=send_text,
+            reply_to=reply_to,
+        )
 
     # ------------------------------------------------------------------
     # Outbound messaging

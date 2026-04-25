@@ -135,7 +135,7 @@ class MentionRouter:
         for _, regex in self._compiled_patterns:
             result = regex.sub("", result).strip()
         # Clean up extra whitespace
-        result = re.sub(r"/n{3,}", "/n/n", result)
+        result = re.sub(r"\n{3,}", "\n\n", result)
         return result.strip() or text
 
     def extract_mentions_from_response(self, response_text: str) -> List[str]:
