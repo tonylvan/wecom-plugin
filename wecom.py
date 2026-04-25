@@ -625,7 +625,7 @@ class WeComAdapter(BasePlatformAdapter):
             # Multi-agent dispatch: if group chat and multi-agent is enabled,
             # route to the appropriate agent(s) before calling handle_message.
             if is_group and self._mention_router.enabled and self._mention_router.cross_agent_enabled:
-                await self._dispatch_group_multi_agent(event, sender_id)
+                await self._dispatch_group_multi_agent(event, sender_id, is_from_bot=is_from_bot)
             else:
                 await self.handle_message(event)
 
@@ -698,7 +698,8 @@ class WeComAdapter(BasePlatformAdapter):
             is_group = event.source.chat_type == "group"
             if is_group and self._mention_router.enabled and self._mention_router.cross_agent_enabled:
                 sender_id = event.source.user_id or ""
-                await self._dispatch_group_multi_agent(event, sender_id)
+                # For batched messages, we cannot reliably detect if from bot
+                await self._dispatch_group_multi_agent(event, sender_id, is_from_bot=False)
             else:
                 await self.handle_message(event)
         finally:
@@ -961,6 +962,7 @@ class WeComAdapter(BasePlatformAdapter):
         self,
         event: "MessageEvent",
         sender_id: str,
+        is_from_bot: bool = False,
     ) -> None:
         """Route a group chat message to the appropriate agent(s) based on @mentions.
 
@@ -1028,23 +1030,25 @@ class WeComAdapter(BasePlatformAdapter):
                 )
                 context_lines.append(chain.get_conversation_context())
                 context_lines.append(
-                    f"\
-[System] Your turn to respond as {agent_cfg.name}."
+                    f"\n[System] Your turn to respond as {agent_cfg.name}."
                 )
             else:
-                # First turn: instruct agent to @mention other agents if discussion is requested
-                other_agents = [
-                    f"@{other_cfg.name}"
-                    for other_id, other_cfg in router.agents.items()
-                    if other_id != agent_id
-                ]
-                if other_agents:
-                    context_lines.append(
-                        f"[System] You are in a group discussion with other agents: "
-                        f"{', '.join(other_agents)}. "
-                        f"If the user asks for a discussion or you want other agents to participate, "
-                        f"please @mention them at the end of your response (e.g., '...@需求专家 @技术专家')."
-                    )
+                context_lines.append(
+                    f"[System] You are in a group discussion. "
+                )
+
+            # Always remind agent about other agents and @mention capability
+            other_agents = [
+                f"@{other_cfg.name}"
+                for other_id, other_cfg in router.agents.items()
+                if other_id != agent_id
+            ]
+            if other_agents:
+                context_lines.append(
+                    f"[System] Other agents in this group: {', '.join(other_agents)}. "
+                    f"If you want to continue the discussion or need other agents' input, "
+                    f"please @mention them at the end of your response (e.g., '...@需求专家 @技术专家')."
+                )
 
             # Prepend context to user message for this agent
             if context_lines:
@@ -1085,12 +1089,14 @@ class WeComAdapter(BasePlatformAdapter):
                 all_responses.append(response_text)
 
                 # Auto-mention other agents that haven't participated yet
+                # In multi-instance mode (Mode A), only auto-mention on first user turn
+                # to avoid infinite loops between bot instances
                 other_agents = [
                     f"@{other_cfg.name}"
                     for other_id, other_cfg in router.agents.items()
                     if other_id != agent_id and other_id not in chain.triggered_agents
                 ]
-                if other_agents:
+                if other_agents and not is_from_bot:
                     response_text = f"{response_text}\n\n{' '.join(other_agents)}"
 
                 # Extract mentions from the final response text (with auto-mentions)
