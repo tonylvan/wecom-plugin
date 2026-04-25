@@ -281,6 +281,11 @@ class WeComAdapter(BasePlatformAdapter):
             max_calls=int(os.getenv("WECOM_RATE_LIMIT_PER_MINUTE", str(WECOM_RATE_LIMIT_PER_MINUTE)))
         )
 
+        # Cross-agent peers for multi-instance mode (Mode A)
+        # Loaded from ~/.hermes/config.yaml cross_agent section
+        self._cross_agent_peers: List[Dict[str, str]] = []
+        self._load_cross_agent_peers()
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -1226,7 +1231,6 @@ class WeComAdapter(BasePlatformAdapter):
             next_agents = [
                 aid for aid in mentioned_agents
                 if aid not in already_triggered
-                and router.get_agent_config(aid) is not None
             ]
 
             if not next_agents:
@@ -1244,58 +1248,106 @@ class WeComAdapter(BasePlatformAdapter):
                     continue
 
                 agent_cfg = router.get_agent_config(agent_id)
-                if agent_cfg is None:
-                    continue
-
-                logger.info(
-                    "[WeCom Multi-Agent] Cross-agent chain: '%s' -> '%s' "
-                    "(depth %d/%d)",
-                    last_turn.agent_id, agent_id,
-                    chain.chain_depth + 1, chain.max_chain_length,
-                )
-
-                # Build full conversation context
-                context = chain.get_conversation_context()
-                enriched_text = (
-                    f"[System] A colleague @{agent_cfg.name} asked you to respond. "
-                    f"Here is the full conversation so far:\n\n{context}\n\n"
-                    f"Please respond as {agent_cfg.name}."
-                )
-
-                enriched_event = MessageEvent(
-                    text=enriched_text,
-                    message_type=original_event.message_type,
-                    source=original_event.source,
-                    raw_message=original_event.raw_message,
-                    message_id=original_event.message_id,
-                    media_urls=original_event.media_urls,
-                    media_types=original_event.media_types,
-                    reply_to_message_id=original_event.reply_to_message_id,
-                    reply_to_text=original_event.reply_to_text,
-                    timestamp=original_event.timestamp,
-                )
-                enriched_event._skip_delivery = True  # type: ignore[attr-defined]
-
-                response_text = await self.handle_message(enriched_event)
-                if response_text:
-                    turn = AgentTurnRecord(
-                        agent_id=agent_id,
-                        agent_name=agent_cfg.name,
-                        request_text=context,
-                        response_text=response_text,
-                        mentions_in_response=[],
-                        started_at=_time.time(),
-                        completed_at=_time.time(),
+                if agent_cfg is not None:
+                    # ---- Local agent ----
+                    logger.info(
+                        "[WeCom Multi-Agent] Cross-agent chain (local): '%s' -> '%s' "
+                        "(depth %d/%d)",
+                        last_turn.agent_id, agent_id,
+                        chain.chain_depth + 1, chain.max_chain_length,
                     )
-                    chain.add_turn(turn)
-                    triggered_any = True
 
-                    await self._send_agent_response(
+                    # Build full conversation context
+                    context = chain.get_conversation_context()
+                    enriched_text = (
+                        f"[System] A colleague @{agent_cfg.name} asked you to respond. "
+                        f"Here is the full conversation so far:\n\n{context}\n\n"
+                        f"Please respond as {agent_cfg.name}."
+                    )
+
+                    enriched_event = MessageEvent(
+                        text=enriched_text,
+                        message_type=original_event.message_type,
+                        source=original_event.source,
+                        raw_message=original_event.raw_message,
+                        message_id=original_event.message_id,
+                        media_urls=original_event.media_urls,
+                        media_types=original_event.media_types,
+                        reply_to_message_id=original_event.reply_to_message_id,
+                        reply_to_text=original_event.reply_to_text,
+                        timestamp=original_event.timestamp,
+                    )
+                    enriched_event._skip_delivery = True  # type: ignore[attr-defined]
+
+                    response_text = await self.handle_message(enriched_event)
+                    if response_text:
+                        turn = AgentTurnRecord(
+                            agent_id=agent_id,
+                            agent_name=agent_cfg.name,
+                            request_text=context,
+                            response_text=response_text,
+                            mentions_in_response=[],
+                            started_at=_time.time(),
+                            completed_at=_time.time(),
+                        )
+                        chain.add_turn(turn)
+                        triggered_any = True
+
+                        await self._send_agent_response(
+                            chat_id=chat_id,
+                            agent_name=agent_cfg.name,
+                            response_text=response_text,
+                            reply_to=original_event.message_id,
+                        )
+                else:
+                    # ---- Remote agent via HTTP ----
+                    # Try to find a peer that handles this agent name
+                    agent_name = agent_id  # agent_id may be the name directly
+                    # Normalize: replace underscores with spaces for matching
+                    peer = self._find_peer_for_agent_name(agent_name)
+                    if peer is None:
+                        peer = self._find_peer_for_agent_name(agent_name.replace("_", " "))
+                    if peer is None:
+                        logger.debug(
+                            "[WeCom Multi-Agent] No local config or peer for agent '%s', skipping",
+                            agent_id,
+                        )
+                        continue
+
+                    logger.info(
+                        "[WeCom Multi-Agent] Cross-agent chain (remote): '%s' -> '%s' "
+                        "via %s (depth %d/%d)",
+                        last_turn.agent_id, agent_id, peer["url"],
+                        chain.chain_depth + 1, chain.max_chain_length,
+                    )
+
+                    context = chain.get_conversation_context()
+                    enriched_text = (
+                        f"[System] A colleague asked you to respond. "
+                        f"Here is the full conversation so far:\n\n{context}\n\n"
+                        f"Please respond as {peer['name']}."
+                    )
+
+                    response_text = await self._trigger_cross_agent_http(
+                        agent_name=peer["name"],
+                        message=enriched_text,
                         chat_id=chat_id,
-                        agent_name=agent_cfg.name,
-                        response_text=response_text,
-                        reply_to=original_event.message_id,
+                        user_id=original_event.source.user_id or "",
+                        source_bot=f"bot-from-{last_turn.agent_name}",
                     )
+                    if response_text:
+                        turn = AgentTurnRecord(
+                            agent_id=agent_id,
+                            agent_name=peer["name"],
+                            request_text=context,
+                            response_text=response_text,
+                            mentions_in_response=[],
+                            started_at=_time.time(),
+                            completed_at=_time.time(),
+                        )
+                        chain.add_turn(turn)
+                        triggered_any = True
+                        # Remote instance sends to WeCom directly — no need to relay
 
             if not triggered_any:
                 break
@@ -1317,6 +1369,114 @@ class WeComAdapter(BasePlatformAdapter):
             content=send_text,
             reply_to=reply_to,
         )
+
+    # ------------------------------------------------------------------
+    # Cross-agent HTTP helpers (multi-instance Mode A)
+    # ------------------------------------------------------------------
+
+    def _load_cross_agent_peers(self) -> None:
+        """Load cross-agent peer config from ~/.hermes/config.yaml.
+
+        Reads the top-level `cross_agent` section::
+            cross_agent:
+              enabled: true
+              peers:
+                - name: "需求专家"
+                  url: "http://192.168.1.113:8642"
+                  key: "cross-agent-key-2026"
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml
+            config_path = get_hermes_home() / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                cross_cfg = cfg.get("cross_agent", {})
+                if isinstance(cross_cfg, dict) and cross_cfg.get("enabled"):
+                    peers = cross_cfg.get("peers", [])
+                    if isinstance(peers, list):
+                        for peer in peers:
+                            if isinstance(peer, dict) and peer.get("name") and peer.get("url"):
+                                self._cross_agent_peers.append({
+                                    "name": str(peer["name"]),
+                                    "url": str(peer["url"]).rstrip("/"),
+                                    "key": str(peer.get("key", "")),
+                                })
+                        if self._cross_agent_peers:
+                            logger.info(
+                                "[WeCom] Loaded %d cross-agent peer(s): %s",
+                                len(self._cross_agent_peers),
+                                [p["name"] for p in self._cross_agent_peers],
+                            )
+        except Exception as e:
+            logger.warning("[WeCom] Failed to load cross-agent peers: %s", e)
+
+    def _find_peer_for_agent_name(self, agent_name: str) -> Optional[Dict[str, str]]:
+        """Find the peer URL that handles the given agent name."""
+        for peer in self._cross_agent_peers:
+            if peer["name"] == agent_name:
+                return peer
+        return None
+
+    async def _trigger_cross_agent_http(
+        self,
+        agent_name: str,
+        message: str,
+        chat_id: str,
+        user_id: str,
+        source_bot: str,
+    ) -> Optional[str]:
+        """Trigger a remote hermes instance via HTTP to handle an agent turn.
+
+        Returns the response text from the remote agent, or None on failure.
+        The remote instance is expected to send the message to WeCom itself
+        (collect_only=False), so we don't need to relay it.
+        """
+        peer = self._find_peer_for_agent_name(agent_name)
+        if peer is None:
+            return None
+
+        target_url = f"{peer['url']}/api/cross-agent"
+        peer_key = peer.get("key", "")
+        payload = {
+            "message": message,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "agent_name": agent_name,
+            "source_bot": source_bot,
+            "chain_depth": 0,
+            "collect_only": False,  # Remote sends to WeCom directly
+        }
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                headers = {"Authorization": f"Bearer {peer_key}"} if peer_key else {}
+                async with session.post(
+                    target_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        response_text = result.get("response", "")
+                        logger.info(
+                            "[WeCom Cross-Agent] HTTP trigger to '%s' succeeded — response=%d chars",
+                            agent_name, len(response_text),
+                        )
+                        return response_text
+                    else:
+                        body = await resp.text()
+                        logger.warning(
+                            "[WeCom Cross-Agent] HTTP trigger to '%s' failed: %d — %s",
+                            agent_name, resp.status, body[:200],
+                        )
+                        return None
+        except Exception as e:
+            logger.error("[WeCom Cross-Agent] HTTP trigger to '%s' error: %s", agent_name, e)
+            return None
 
     # ------------------------------------------------------------------
     # Outbound messaging
