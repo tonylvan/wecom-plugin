@@ -87,7 +87,9 @@ APP_CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
 CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
 NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
 
-MAX_MESSAGE_LENGTH = 4000
+# WeCom limits: 20 messages per minute per bot, 2048 bytes per message
+MAX_MESSAGE_LENGTH = 2048  # bytes, not characters
+WECOM_RATE_LIMIT_PER_MINUTE = 20
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -103,6 +105,60 @@ ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
 UPLOAD_CHUNK_SIZE = 512 * 1024
 MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
+
+
+class RateLimiter:
+    """Simple sliding-window rate limiter for WeCom message sending.
+
+    WeCom allows 20 messages per minute per bot.  We keep a deque of
+    timestamps and wait if the window is full.
+    """
+
+    def __init__(self, max_calls: int = WECOM_RATE_LIMIT_PER_MINUTE, window_seconds: float = 60.0) -> None:
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self._timestamps: List[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> float:
+        """Wait until a slot is available. Returns the wait time."""
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            # Remove timestamps outside the window
+            cutoff = now - self.window_seconds
+            self._timestamps = [ts for ts in self._timestamps if ts > cutoff]
+
+            if len(self._timestamps) >= self.max_calls:
+                # Wait until the oldest timestamp expires
+                oldest = self._timestamps[0]
+                wait_time = oldest + self.window_seconds - now
+                if wait_time > 0:
+                    return wait_time
+            return 0.0
+
+    def record_call(self) -> None:
+        """Record a successful call. Must be called after acquire()."""
+        now = asyncio.get_running_loop().time()
+        self._timestamps.append(now)
+
+
+def _truncate_to_byte_limit(text: str, max_bytes: int = MAX_MESSAGE_LENGTH) -> str:
+    """Truncate text so that its UTF-8 encoded length does not exceed max_bytes.
+
+    WeCom counts bytes, not characters. A single CJK character is 3 bytes.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    # Truncate by bytes, then decode safely
+    truncated = encoded[:max_bytes]
+    # Remove potential partial multi-byte character at the end
+    while truncated:
+        try:
+            return truncated.decode("utf-8")
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    return ""
 
 
 def check_wecom_requirements() -> bool:
@@ -219,6 +275,11 @@ class WeComAdapter(BasePlatformAdapter):
         # in group chats. Disabled by default — requires explicit config.
         self._mention_router = MentionRouter.from_wecom_extra(extra)
         self._multi_agent_chains: Dict[str, asyncio.Task] = {}  # chat_id → chain task
+
+        # Rate limiter for WeCom message sending (20 msg/min per bot)
+        self._rate_limiter = RateLimiter(
+            max_calls=int(os.getenv("WECOM_RATE_LIMIT_PER_MINUTE", str(WECOM_RATE_LIMIT_PER_MINUTE)))
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1568,6 +1629,7 @@ class WeComAdapter(BasePlatformAdapter):
         return response
 
     async def _send_reply_stream(self, reply_req_id: str, content: str) -> Dict[str, Any]:
+        truncated = _truncate_to_byte_limit(content, self.MAX_MESSAGE_LENGTH)
         response = await self._send_reply_request(
             reply_req_id,
             {
@@ -1575,7 +1637,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "stream": {
                     "id": self._new_req_id("stream"),
                     "finish": True,
-                    "content": content[:self.MAX_MESSAGE_LENGTH],
+                    "content": truncated,
                 },
             },
         )
@@ -1699,12 +1761,14 @@ class WeComAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send markdown to a WeCom chat via proactive ``aibot_send_msg``.
-        
+
         Supports ``mention_userids`` in metadata to @mention users in group chats.
         For markdown messages, injects ``<@userid>`` into the content.
         For text/reply messages, uses ``mentioned_list`` in the payload.
         DM conversations are unaffected — metadata is simply ignored when
         ``mention_userids`` is absent.
+
+        Respects WeCom rate limits (20 msg/min) and byte-length limits (2048 bytes).
         """
         mention_names: List[str] = []
         if metadata and isinstance(metadata, dict):
@@ -1720,15 +1784,32 @@ class WeComAdapter(BasePlatformAdapter):
             mention_tags = " ".join(f"@{n}" for n in mention_names)
             content = f"{mention_tags}\n{content}"
 
+        # Apply rate limiting (WeCom: 20 messages per minute per bot)
+        wait_time = await self._rate_limiter.acquire()
+        if wait_time > 0:
+            logger.info(
+                "[%s] Rate limit reached, waiting %.1fs before sending to %s",
+                self.name, wait_time, chat_id,
+            )
+            await asyncio.sleep(wait_time)
+
+        # Truncate to byte limit (WeCom counts UTF-8 bytes, not characters)
+        truncated_content = _truncate_to_byte_limit(content, self.MAX_MESSAGE_LENGTH)
+        if truncated_content != content:
+            logger.warning(
+                "[%s] Message truncated from %d to %d bytes for WeCom limit",
+                self.name, len(content.encode("utf-8")), len(truncated_content.encode("utf-8")),
+            )
+
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
             if reply_req_id:
-                response = await self._send_reply_stream(reply_req_id, content)
+                response = await self._send_reply_stream(reply_req_id, truncated_content)
             else:
                 payload: Dict[str, Any] = {
                     "chatid": chat_id,
                     "msgtype": "markdown",
-                    "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                    "markdown": {"content": truncated_content},
                 }
                 # Also add mentioned_list for API-level mention support
                 if mention_names:
@@ -1739,6 +1820,9 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] Send failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
+
+        # Record successful call for rate limiting
+        self._rate_limiter.record_call()
 
         error = self._response_error(response)
         if error:
